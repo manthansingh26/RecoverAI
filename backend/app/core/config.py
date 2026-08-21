@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg://recoverai:recoverai@localhost:5432/recoverai"
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
+    # Milestone 3: Recovery Decision & Policy Engine settings
+    RECOVERY_MAX_RETRIES: int = 2
+    RECOVERY_HIGH_VALUE_THRESHOLD_PAISE: int = 5000000
+    RECOVERY_RETRY_DELAY_SECONDS: int = 1800
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
