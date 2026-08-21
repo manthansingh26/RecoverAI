@@ -68,11 +68,18 @@ def _setup_test_database() -> None:
 def db_session() -> Session:
     """Provide a transactional database session for a single test.
 
-    Each test gets a fresh session that is rolled back after the test.
+    Truncates all data tables before each test to ensure clean state,
+    then yields a session. Rolls back after the test.
     """
     test_engine = create_engine(TEST_DATABASE_URL)
     TestSessionLocal = sessionmaker(bind=test_engine)
     session = TestSessionLocal()
+
+    # Clean data tables before each test to avoid cross-test contamination
+    # (some services call db.commit() internally, persisting across sessions)
+    with test_engine.connect() as conn:
+        conn.execute(text("TRUNCATE execution_logs, recovery_cases, payment_events, customers CASCADE"))
+        conn.commit()
 
     # Override the get_db dependency for FastAPI test client
     def override_get_db():
