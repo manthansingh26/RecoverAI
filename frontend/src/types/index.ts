@@ -135,3 +135,50 @@ export interface DashboardSummary {
 export interface ApiError {
   detail: string;
 }
+
+// --- Simulation (Milestone 8) ---
+
+export type SimulationScenario =
+  | 'LOW_VALUE_TRANSIENT'
+  | 'MEDIUM_VALUE_RECOVERABLE'
+  | 'HIGH_VALUE_HUMAN_REVIEW'
+  | 'PERMANENT_FAILURE';
+
+export interface WorkflowResultItem {
+  recovery_case_id: string;
+  previous_status: string;
+  new_status: string;
+  processed: boolean;
+  message: string;
+}
+
+export interface SimulationExecutionResult {
+  strategy: string;
+  execution_mode: string;
+  status: string;
+  previous_case_status: string;
+  new_case_status: string;
+  message: string;
+}
+
+export interface SimulationResult {
+  success: boolean;
+  scenario: string;
+  payment_id: string;
+  event_id: string;
+  recovery_case_id: string | null;
+  amount_paise: number;
+  currency: string;
+  error_code: string | null;
+  error_reason: string | null;
+  failure_category: string | null;
+  recommended_strategy: string | null;
+  recovery_probability: number | null;
+  status: string | null;
+  requires_human_approval: boolean;
+  approved_by_human: boolean | null;
+  execution_result: SimulationExecutionResult | null;
+  workflow: WorkflowResultItem | null;
+  message: string;
+  duplicate: boolean;
+}

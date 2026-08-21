@@ -1,3 +1,4 @@
+import { useState, useCallback } from 'react';
 import {
   FolderSearch,
   Clock,
@@ -7,6 +8,7 @@ import {
   Activity,
   PlayCircle,
   Ban,
+  Sparkles,
 } from 'lucide-react';
 import { fetchDashboardSummary } from '../api/dashboard';
 import { useApi } from '../hooks/useApi';
@@ -15,12 +17,18 @@ import SummaryCard from '../components/SummaryCard';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import EmptyState from '../components/EmptyState';
+import SimulationModal from '../components/SimulationModal';
 
 export default function DashboardPage() {
   const { data, loading, error, refetch } = useApi(
     () => fetchDashboardSummary(),
     [],
   );
+  const [simulationOpen, setSimulationOpen] = useState(false);
+
+  const handleSimulationSuccess = useCallback(() => {
+    refetch();
+  }, [refetch]);
 
   return (
     <div>
@@ -29,6 +37,15 @@ export default function DashboardPage() {
         description="Recovery operations overview"
         onRefresh={refetch}
         loading={loading}
+        actions={
+          <button
+            onClick={() => setSimulationOpen(true)}
+            className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            Simulate Payment Failure
+          </button>
+        }
       />
 
       {loading && <LoadingSpinner text="Loading dashboard metrics..." />}
@@ -40,7 +57,7 @@ export default function DashboardPage() {
           {data.total_cases === 0 ? (
             <EmptyState
               title="No recovery cases yet"
-              description="Cases will appear here once payment events are received."
+              description="Cases will appear here once payment events are received. Click 'Simulate Payment Failure' to create a demo scenario."
             />
           ) : (
             <>
@@ -157,6 +174,13 @@ export default function DashboardPage() {
           )}
         </>
       )}
+
+      {/* Simulation Modal */}
+      <SimulationModal
+        isOpen={simulationOpen}
+        onClose={() => setSimulationOpen(false)}
+        onSuccess={handleSimulationSuccess}
+      />
     </div>
   );
 }
