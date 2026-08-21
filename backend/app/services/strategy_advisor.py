@@ -9,6 +9,7 @@ All public functions are pure — no external API calls.
 
 from dataclasses import dataclass, field
 
+from app.core.config import settings
 from app.models.enums import FailureCategory, RecoveryStrategy
 
 
@@ -97,7 +98,7 @@ def recommend_strategy(
     # Add contextual risk flags
     if retry_count > 0:
         risk_flags.append(f"retry_attempt_{retry_count}")
-    if amount_paise >= 5_000_000:
+    if amount_paise >= settings.RECOVERY_HIGH_VALUE_THRESHOLD_PAISE:
         risk_flags.append("high_value_transaction")
 
     requires_human = category in (
