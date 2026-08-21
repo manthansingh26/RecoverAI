@@ -1,0 +1,9 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic-settings==2.7.1
+httpx==0.28.1
+pytest==8.3.4
+pytest-asyncio==0.24.0
+sqlalchemy==2.0.52
+alembic==1.14.1
+psycopg[binary]==3.2.13
