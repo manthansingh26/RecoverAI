@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     RECOVERY_HIGH_VALUE_THRESHOLD_PAISE: int = 5000000
     RECOVERY_RETRY_DELAY_SECONDS: int = 1800
 
+    # Milestone 5: Execution Engine settings
+    EXECUTION_MODE: str = "SIMULATION"
+    RAZORPAY_KEY_ID: str = ""
+    RAZORPAY_KEY_SECRET: str = ""
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

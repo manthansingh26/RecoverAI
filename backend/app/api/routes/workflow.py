@@ -18,7 +18,7 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.services.recovery_workflow import (
     WorkflowSummary,
-    discover_due_cases,
+    discover_and_execute_due_cases,
     process_received_cases,
 )
 
@@ -39,6 +39,10 @@ class WorkflowResponse(BaseModel):
     received_processed: int
     received_skipped: int
     due_cases_found: int
+    execution_attempted: int
+    execution_succeeded: int
+    execution_failed: int
+    execution_blocked: int
     results: list[dict]
     message: str
 
@@ -50,6 +54,10 @@ def _summary_to_response(summary: WorkflowSummary) -> WorkflowResponse:
         received_processed=summary.received_processed,
         received_skipped=summary.received_skipped,
         due_cases_found=summary.due_cases_found,
+        execution_attempted=summary.execution_attempted,
+        execution_succeeded=summary.execution_succeeded,
+        execution_failed=summary.execution_failed,
+        execution_blocked=summary.execution_blocked,
         results=[
             {
                 "recovery_case_id": r.recovery_case_id,
@@ -63,7 +71,11 @@ def _summary_to_response(summary: WorkflowSummary) -> WorkflowResponse:
         message=(
             f"Processed {summary.received_processed} RECEIVED cases, "
             f"skipped {summary.received_skipped}, "
-            f"discovered {summary.due_cases_found} due cases"
+            f"discovered {summary.due_cases_found} due cases, "
+            f"executed {summary.execution_attempted} ("
+            f"{summary.execution_succeeded} succeeded, "
+            f"{summary.execution_failed} failed, "
+            f"{summary.execution_blocked} blocked)"
         ),
     )
 
@@ -77,14 +89,14 @@ async def process_recovery_workflow(
     This endpoint:
     - Only works in development or test environments.
     - Processes all eligible RECEIVED cases through the Decision Engine.
-    - Discovers due PENDING_EXECUTION cases (discovery only, no execution).
-    - Does NOT perform any real financial actions.
+    - Discovers and executes due PENDING_EXECUTION cases.
+    - In SIMULATION mode (default), no real financial actions occur.
 
     Args:
         db: Database session dependency.
 
     Returns:
-        WorkflowResponse with processing results.
+        WorkflowResponse with processing and execution results.
 
     Raises:
         HTTPException 404: Workflow endpoint not available outside dev/test.
@@ -100,22 +112,27 @@ async def process_recovery_workflow(
     # Process RECEIVED cases
     received_summary = process_received_cases(db)
 
-    # Discover due PENDING_EXECUTION cases
-    due_summary = discover_due_cases(db)
+    # Discover and execute due PENDING_EXECUTION cases
+    exec_summary = discover_and_execute_due_cases(db)
 
     # Combine results
     combined = WorkflowSummary(
         received_processed=received_summary.received_processed,
         received_skipped=received_summary.received_skipped,
-        due_cases_found=due_summary.due_cases_found,
-        results=received_summary.results + due_summary.results,
+        due_cases_found=exec_summary.due_cases_found,
+        execution_attempted=exec_summary.execution_attempted,
+        execution_succeeded=exec_summary.execution_succeeded,
+        execution_failed=exec_summary.execution_failed,
+        execution_blocked=exec_summary.execution_blocked,
+        results=received_summary.results + exec_summary.results,
     )
 
     logger.info(
-        "Manual workflow trigger: processed=%d skipped=%d due=%d",
+        "Manual workflow trigger: processed=%d skipped=%d due=%d executed=%d",
         combined.received_processed,
         combined.received_skipped,
         combined.due_cases_found,
+        combined.execution_attempted,
     )
 
     return _summary_to_response(combined)

@@ -3,11 +3,11 @@
 Responsibilities:
 - Discover RECEIVED cases and run the Decision Engine on them
 - Discover due PENDING_EXECUTION cases (next_run_at <= now)
+- Execute eligible due cases via the Recovery Executor
 - Ensure idempotency and concurrency safety
-- NEVER execute real Razorpay actions (that belongs to Milestone 5)
 
 This module is the "scheduler" entry point that connects ingestion
-to the decision engine without background threads or infinite loops.
+to the decision engine and execution engine without background threads.
 """
 
 import logging
@@ -21,6 +21,11 @@ from sqlalchemy.orm import Session
 from app.models.enums import RecoveryStatus
 from app.models.recovery_case import RecoveryCase
 from app.services.decision_engine import run_decision_engine
+from app.services.recovery_executor import (
+    ExecutionSummary,
+    SimulationBehavior,
+    execute_due_cases,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +48,15 @@ class WorkflowSummary:
     received_processed: int
     received_skipped: int
     due_cases_found: int
-    results: list[WorkflowResult]
+    execution_attempted: int = 0
+    execution_succeeded: int = 0
+    execution_failed: int = 0
+    execution_blocked: int = 0
+    results: list[WorkflowResult] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.results is None:
+            self.results = []
 
 
 def get_received_cases(db: Session) -> list[RecoveryCase]:
@@ -207,37 +220,56 @@ def process_received_cases(db: Session) -> WorkflowSummary:
     )
 
 
-def discover_due_cases(db: Session) -> WorkflowSummary:
-    """Discover PENDING_EXECUTION cases that are due for execution.
+def discover_and_execute_due_cases(
+    db: Session,
+    *,
+    sim_behavior: SimulationBehavior | None = None,
+) -> WorkflowSummary:
+    """Discover due PENDING_EXECUTION cases and execute them.
 
-    In Milestone 4, this is discovery only — no execution occurs.
-    Due cases are returned but remain in PENDING_EXECUTION state
-    for Milestone 5 to act on.
+    In Milestone 5, due cases are passed to the execution engine.
+    Execution mode is controlled by config (default: SIMULATION).
 
     Args:
         db: Active database session.
+        sim_behavior: Optional simulation behavior override for testing.
 
     Returns:
-        WorkflowSummary with due case information.
+        WorkflowSummary with due case and execution information.
     """
+    # First, discover due cases for reporting
     due_cases = get_due_recovery_cases(db)
 
-    results = [
-        WorkflowResult(
-            recovery_case_id=str(rc.id),
-            previous_status=rc.status,
-            new_status=rc.status,
-            processed=False,
-            message=f"Due case discovered (next_run_at={rc.next_run_at})",
-        )
-        for rc in due_cases
-    ]
+    # Execute eligible due cases
+    exec_summary = execute_due_cases(db, sim_behavior=sim_behavior)
 
-    logger.info("Workflow discovered %d due PENDING_EXECUTION cases", len(due_cases))
+    # Build results from execution
+    results: list[WorkflowResult] = []
+    for er in exec_summary.results:
+        results.append(WorkflowResult(
+            recovery_case_id=er.recovery_case_id,
+            previous_status=er.previous_case_status,
+            new_status=er.new_case_status,
+            processed=er.status != "BLOCKED",
+            message=er.message,
+        ))
+
+    logger.info(
+        "Workflow due cases: discovered=%d attempted=%d succeeded=%d failed=%d blocked=%d",
+        len(due_cases),
+        exec_summary.attempted,
+        exec_summary.succeeded,
+        exec_summary.failed,
+        exec_summary.blocked,
+    )
 
     return WorkflowSummary(
         received_processed=0,
         received_skipped=0,
         due_cases_found=len(due_cases),
+        execution_attempted=exec_summary.attempted,
+        execution_succeeded=exec_summary.succeeded,
+        execution_failed=exec_summary.failed,
+        execution_blocked=exec_summary.blocked,
         results=results,
     )

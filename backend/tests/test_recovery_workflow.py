@@ -33,7 +33,7 @@ from app.models.recovery_case import RecoveryCase
 from app.services.recovery_workflow import (
     WorkflowResult,
     WorkflowSummary,
-    discover_due_cases,
+    discover_and_execute_due_cases,
     get_due_recovery_cases,
     get_received_cases,
     process_received_case,
@@ -323,25 +323,36 @@ class TestProcessReceivedCases:
 # Unit Tests: discover_due_cases
 # ---------------------------------------------------------------------------
 
-class TestDiscoverDueCases:
-    """Test discovery of due PENDING_EXECUTION cases."""
+class TestDiscoverAndExecuteDueCases:
+    """Test discovery and execution of due PENDING_EXECUTION cases."""
 
-    def test_discovers_due_cases(self, db_session) -> None:
+    def test_discovers_and_executes_due_cases(self, db_session) -> None:
         pe = _create_test_payment_event(db_session)
         past_time = datetime.now(timezone.utc) - timedelta(hours=1)
-        rc = _create_test_recovery_case(
-            db_session,
-            pe,
+        # Create a case with strategy set so it's eligible for execution
+        rc = RecoveryCase(
+            payment_event_id=pe.id,
             status=RecoveryStatus.PENDING_EXECUTION.value,
+            failure_category=FailureCategory.TRANSIENT.value,
+            recovery_probability=0.8,
+            priority_score=800.0,
+            recommended_strategy=RecoveryStrategy.WAIT_AND_RETRY.value,
+            expected_value_paise=80000,
+            decision_audit_trail={},
             next_run_at=past_time,
+            retry_count=0,
+            requires_human_approval=False,
+            approved_by_human=None,
         )
+        db_session.add(rc)
         db_session.commit()
 
-        summary = discover_due_cases(db_session)
+        from app.services.recovery_executor import SimulationBehavior
+        sim = SimulationBehavior()
+        summary = discover_and_execute_due_cases(db_session, sim_behavior=sim)
 
         assert summary.due_cases_found == 1
-        assert len(summary.results) == 1
-        assert summary.results[0].recovery_case_id == str(rc.id)
+        assert summary.execution_attempted >= 1
 
     def test_no_due_cases_when_all_future(self, db_session) -> None:
         pe = _create_test_payment_event(db_session)
@@ -354,30 +365,8 @@ class TestDiscoverDueCases:
         )
         db_session.commit()
 
-        summary = discover_due_cases(db_session)
+        summary = discover_and_execute_due_cases(db_session)
         assert summary.due_cases_found == 0
-
-    def test_due_cases_not_executed(self, db_session) -> None:
-        """Due cases should be discovered but NOT executed in Milestone 4."""
-        pe = _create_test_payment_event(db_session)
-        past_time = datetime.now(timezone.utc) - timedelta(hours=1)
-        rc = _create_test_recovery_case(
-            db_session,
-            pe,
-            status=RecoveryStatus.PENDING_EXECUTION.value,
-            next_run_at=past_time,
-        )
-        db_session.commit()
-
-        summary = discover_due_cases(db_session)
-
-        # Due cases found but not processed (no execution in M4)
-        assert summary.due_cases_found == 1
-        assert summary.received_processed == 0
-
-        # Case remains in PENDING_EXECUTION
-        db_session.refresh(rc)
-        assert rc.status == RecoveryStatus.PENDING_EXECUTION.value
 
 
 # ---------------------------------------------------------------------------
