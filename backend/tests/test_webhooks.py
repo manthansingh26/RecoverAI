@@ -393,6 +393,188 @@ class TestWebhookIngestion:
 # Simulation Endpoint Tests
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Audit Trail Tests
+# ---------------------------------------------------------------------------
+
+class TestAuditTrail:
+    """Verify audit trail distinguishes real webhooks from simulations."""
+
+    @pytest.mark.asyncio
+    async def test_real_webhook_audit_trail(self, db_session) -> None:
+        """Real webhook ingestion audit trail contains source=razorpay_webhook and signature_verified=true."""
+        secret = settings.RAZORPAY_WEBHOOK_SECRET or "test_secret_123"
+        body = make_valid_payment_failed_body()
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+        event_id = "evt_audit_real_001"
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+
+            assert response.status_code == 200
+
+            # Verify audit trail in database
+            pe = db_session.execute(
+                select(PaymentEvent).where(
+                    PaymentEvent.external_event_id == event_id
+                )
+            ).scalar_one_or_none()
+            assert pe is not None
+
+            rc = db_session.execute(
+                select(RecoveryCase).where(
+                    RecoveryCase.payment_event_id == pe.id
+                )
+            ).scalar_one_or_none()
+            assert rc is not None
+
+            audit = rc.decision_audit_trail
+            assert audit["ingestion"]["source"] == "razorpay_webhook"
+            assert audit["ingestion"]["signature_verified"] is True
+            assert audit["ingestion"]["event_id"] == event_id
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_simulation_audit_trail(self, db_session) -> None:
+        """Simulation ingestion audit trail contains source=simulation and signature_verified=false."""
+        original_env = settings.APP_ENV
+        settings.APP_ENV = "development"
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/api/dev/simulate/payment-failed",
+                    json={
+                        "event_id": "sim_audit_001",
+                        "amount_paise": 75000,
+                    },
+                )
+
+            assert response.status_code == 200
+
+            # Verify audit trail in database
+            pe = db_session.execute(
+                select(PaymentEvent).where(
+                    PaymentEvent.external_event_id == "sim_audit_001"
+                )
+            ).scalar_one_or_none()
+            assert pe is not None
+
+            rc = db_session.execute(
+                select(RecoveryCase).where(
+                    RecoveryCase.payment_event_id == pe.id
+                )
+            ).scalar_one_or_none()
+            assert rc is not None
+
+            audit = rc.decision_audit_trail
+            assert audit["ingestion"]["source"] == "simulation"
+            assert audit["ingestion"]["signature_verified"] is False
+            assert audit["ingestion"]["event_id"] == "sim_audit_001"
+        finally:
+            settings.APP_ENV = original_env
+
+    @pytest.mark.asyncio
+    async def test_webhook_and_simulation_use_same_core_function(self, db_session) -> None:
+        """Both webhook and simulation produce identical RecoveryCase structure.
+
+        Verifies through behavior: same status, same failure_category,
+        same default field values — confirming they share the same code path.
+        """
+        # --- Webhook path ---
+        secret = settings.RAZORPAY_WEBHOOK_SECRET or "test_secret_123"
+        body = make_valid_payment_failed_body()
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                resp_wh = await client.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": "evt_shared_core_001",
+                        "Content-Type": "application/json",
+                    },
+                )
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+        assert resp_wh.status_code == 200
+
+        # --- Simulation path ---
+        original_env = settings.APP_ENV
+        settings.APP_ENV = "development"
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                resp_sim = await client.post(
+                    "/api/dev/simulate/payment-failed",
+                    json={"event_id": "sim_shared_core_001", "amount_paise": 100000},
+                )
+        finally:
+            settings.APP_ENV = original_env
+
+        assert resp_sim.status_code == 200
+
+        # Both produce the same RecoveryCase defaults
+        pe_wh = db_session.execute(
+            select(PaymentEvent).where(PaymentEvent.external_event_id == "evt_shared_core_001")
+        ).scalar_one()
+        rc_wh = db_session.execute(
+            select(RecoveryCase).where(RecoveryCase.payment_event_id == pe_wh.id)
+        ).scalar_one()
+
+        pe_sim = db_session.execute(
+            select(PaymentEvent).where(PaymentEvent.external_event_id == "sim_shared_core_001")
+        ).scalar_one()
+        rc_sim = db_session.execute(
+            select(RecoveryCase).where(RecoveryCase.payment_event_id == pe_sim.id)
+        ).scalar_one()
+
+        # Identical structure from shared core
+        assert rc_wh.status == rc_sim.status == "RECEIVED"
+        assert rc_wh.failure_category == rc_sim.failure_category == "UNKNOWN"
+        assert rc_wh.retry_count == rc_sim.retry_count == 0
+        assert rc_wh.requires_human_approval == rc_sim.requires_human_approval is False
+        assert rc_wh.recovery_probability is rc_sim.recovery_probability is None
+        assert rc_wh.priority_score is rc_sim.priority_score is None
+        assert rc_wh.recommended_strategy is rc_sim.recommended_strategy is None
+        assert rc_wh.expected_value_paise is rc_sim.expected_value_paise is None
+        assert rc_wh.approved_by_human is rc_sim.approved_by_human is None
+
+        # Audit trails differ only in source and signature_verified
+        assert rc_wh.decision_audit_trail["ingestion"]["source"] == "razorpay_webhook"
+        assert rc_wh.decision_audit_trail["ingestion"]["signature_verified"] is True
+        assert rc_sim.decision_audit_trail["ingestion"]["source"] == "simulation"
+        assert rc_sim.decision_audit_trail["ingestion"]["signature_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Simulation Endpoint Tests
+# ---------------------------------------------------------------------------
+
 class TestSimulationEndpoint:
     """Tests for POST /api/dev/simulate/payment-failed."""
 

@@ -117,7 +117,12 @@ async def razorpay_webhook(
         )
 
     # 7. Persist with idempotency
-    result = ingest_payment_event(db=db, normalized=normalized)
+    result = ingest_payment_event(
+        db=db,
+        normalized=normalized,
+        source="razorpay_webhook",
+        signature_verified=True,
+    )
 
     if not result.success:
         logger.error("Ingestion failed: %s", result.message)

@@ -9,6 +9,7 @@ NOT a replacement for the real Razorpay webhook endpoint.
 """
 
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -19,7 +20,7 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.schemas.simulation import SimulationRequest
 from app.schemas.webhook import WebhookResponse
-from app.services.ingestion_service import ingest_simulation_event
+from app.services.ingestion_service import ingest_payment_event
 from app.services.payment_normalizer import normalize_payment_failed
 
 logger = logging.getLogger(__name__)
@@ -71,7 +72,7 @@ async def simulate_payment_failed(
         "entity": "event",
         "event": "payment.failed",
         "account_id": "simulated_account",
-        "created_at": int(__import__("time").time()),
+        "created_at": int(time.time()),
         "payload": {
             "payment": {
                 "id": request.payment_id or f"pay_sim_{uuid.uuid4().hex[:12]}",
@@ -100,8 +101,13 @@ async def simulate_payment_failed(
             detail=f"Simulation payload invalid: {e}",
         )
 
-    # Persist using the simulation-specific ingestion path
-    result = ingest_simulation_event(db=db, normalized=normalized)
+    # Persist using the shared ingestion function
+    result = ingest_payment_event(
+        db=db,
+        normalized=normalized,
+        source="simulation",
+        signature_verified=False,
+    )
 
     if not result.success:
         logger.error("Simulation ingestion failed: %s", result.message)
