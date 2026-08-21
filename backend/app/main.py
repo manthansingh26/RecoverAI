@@ -2,7 +2,9 @@
 
 from fastapi import FastAPI
 
+from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.health import router as health_router
+from app.api.routes.recovery_cases import router as recovery_cases_router
 from app.api.routes.simulation import router as simulation_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflow import router as workflow_router
@@ -21,6 +23,8 @@ def create_app() -> FastAPI:
     app.include_router(webhooks_router)
     app.include_router(simulation_router)
     app.include_router(workflow_router)
+    app.include_router(recovery_cases_router)
+    app.include_router(dashboard_router)
 
     @app.get("/")
     async def root() -> dict[str, str]:

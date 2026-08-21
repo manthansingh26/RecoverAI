@@ -137,3 +137,61 @@ DATABASE_URL=postgresql+psycopg://recoverai:recoverai@localhost:5432/recoverai
 ```
 
 **Important:** Alembic manages all schema changes. Never call `create_all()` from application code.
+
+## Milestone 6 — Recovery Dashboard & Human Review API
+
+### Overview
+
+A backend API for administrators/reviewers to manage recovery cases, approve/reject human-review cases, and view system metrics.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|---
+| `/api/recovery-cases` | GET | List cases with filtering & pagination |
+| `/api/recovery-cases/{id}` | GET | Case detail with payment event & logs |
+| `/api/recovery-cases/{id}/execution-logs` | GET | Paginated execution history |
+| `/api/recovery-cases/{id}/approve` | POST | Approve a human-review case |
+| `/api/recovery-cases/{id}/reject` | POST | Reject a human-review case |
+| `/api/recovery-cases/{id}/execute` | POST | Manual safe execution (dev only) |
+| `/api/dashboard/summary` | GET | Dashboard summary metrics |
+
+### Human Approval Flow
+
+1. Case enters `REQUIRES_HUMAN` status with `requires_human_approval=true`, `approved_by_human=null`
+2. Reviewer approves → `approved_by_human=true`, status transitions to `PENDING_EXECUTION`
+3. Case becomes eligible for execution via the existing workflow
+
+### Rejection Flow
+
+1. Reviewer rejects → `approved_by_human=false`, status transitions to `RESOLVED_FAILED`
+2. Rejected cases can never be auto-executed
+3. Re-approval after rejection is not allowed
+
+### Safety Guarantees
+
+- Approval/rejection is idempotent
+- Concurrent requests are safe via `SELECT ... FOR UPDATE`
+- Manual execution uses existing `execute_single_case()` with all safety checks
+- Real Razorpay execution remains disabled
+- `EXECUTION_MODE` defaults to `SIMULATION`
+
+### List API Filters
+
+```
+GET /api/recovery-cases?status=REQUIRES_HUMAN&requires_human_approval=true&page=1&page_size=20
+```
+
+### Dashboard Metrics
+
+```
+GET /api/dashboard/summary
+```
+
+Returns: total_cases, received_cases, pending_execution_cases, requires_human_cases, resolved_success/failed, awaiting_human_review, approved_cases, execution metrics.
+
+### Running Tests
+
+```bash
+pytest -q
+```
