@@ -1,0 +1,137 @@
+/**
+ * TypeScript types matching the actual backend Pydantic schemas.
+ * Based on: backend/app/schemas/recovery_case.py
+ */
+
+// --- Pagination ---
+
+export interface PaginationMeta {
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+}
+
+// --- Recovery Case List ---
+
+export interface RecoveryCaseListItem {
+  recovery_case_id: string;
+  status: string;
+  failure_category: string;
+  recommended_strategy: string | null;
+  retry_count: number;
+  next_run_at: string | null;
+  requires_human_approval: boolean;
+  approved_by_human: boolean | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RecoveryCaseListResponse {
+  items: RecoveryCaseListItem[];
+  pagination: PaginationMeta;
+}
+
+// --- Payment Event Summary ---
+
+export interface PaymentEventSummary {
+  payment_event_id: string;
+  event_type: string;
+  external_payment_id: string | null;
+  external_order_id: string | null;
+  amount_paise: number;
+  currency: string;
+  error_code: string | null;
+  error_reason: string | null;
+  error_description: string | null;
+  created_at: string;
+}
+
+// --- Execution Log Summary ---
+
+export interface ExecutionLogSummary {
+  execution_log_id: string;
+  action: string;
+  execution_mode: string;
+  status: string;
+  request_data: Record<string, unknown>;
+  response_data: Record<string, unknown>;
+  error_message: string | null;
+  executed_at: string | null;
+  created_at: string;
+}
+
+// --- Recovery Case Detail ---
+
+export interface RecoveryCaseDetail {
+  recovery_case_id: string;
+  status: string;
+  failure_category: string;
+  recovery_probability: number | null;
+  priority_score: number | null;
+  recommended_strategy: string | null;
+  expected_value_paise: number | null;
+  retry_count: number;
+  next_run_at: string | null;
+  requires_human_approval: boolean;
+  approved_by_human: boolean | null;
+  created_at: string;
+  updated_at: string;
+  payment_event: PaymentEventSummary | null;
+  recent_execution_logs: ExecutionLogSummary[];
+  decision_audit_trail: Record<string, unknown>;
+}
+
+// --- Execution Logs Response ---
+
+export interface ExecutionLogsResponse {
+  items: ExecutionLogSummary[];
+  pagination: PaginationMeta;
+}
+
+// --- Review Action Response ---
+
+export interface ReviewActionResponse {
+  recovery_case_id: string;
+  previous_status: string;
+  new_status: string;
+  previous_approved_by_human: boolean | null;
+  new_approved_by_human: boolean | null;
+  action: string;
+  message: string;
+}
+
+// --- Execution Response ---
+
+export interface ExecutionResponse {
+  recovery_case_id: string;
+  strategy: string;
+  execution_mode: string;
+  status: string;
+  previous_case_status: string;
+  new_case_status: string;
+  message: string;
+}
+
+// --- Dashboard Summary ---
+
+export interface DashboardSummary {
+  total_cases: number;
+  received_cases: number;
+  pending_execution_cases: number;
+  requires_human_cases: number;
+  resolved_success_cases: number;
+  resolved_failed_cases: number;
+  awaiting_human_review: number;
+  approved_cases: number;
+  total_execution_attempts: number;
+  successful_executions: number;
+  failed_executions: number;
+  blocked_executions: number;
+}
+
+// --- API Error ---
+
+export interface ApiError {
+  detail: string;
+}
