@@ -137,3 +137,53 @@
 **Rationale:** Application code can have bugs. Database constraints catch violations at the data layer regardless of how the data was written (direct SQL, ORM, migration scripts, etc.).
 
 **Consequences:** Key constraints include: `retry_count >= 0`, `recovery_probability` between 0 and 1, unique `idempotency_key`, unique `payment_event_id` on recovery cases, and non-null `amount_paise`. These constraints are defined in the ORM models and applied via Alembic migrations.
+
+---
+
+## ADR-015: Raw body verified before JSON parsing
+
+**Decision:** The raw HTTP request body bytes must be captured and used for HMAC signature verification before any JSON parsing occurs.
+
+**Rationale:** Razorpay's webhook signature is computed over the exact raw bytes. Parsing the JSON and re-encoding it could change key ordering or whitespace, producing a different byte sequence and a mismatched signature. Verifying the raw body ensures the signature check is faithful to Razorpay's computation.
+
+**Consequences:** The webhook route reads `await request.body()` first, computes HMAC-SHA256 over those bytes, and only parses JSON after successful verification. This prevents both security bypass and false rejections.
+
+---
+
+## ADR-016: x-razorpay-event-id as primary webhook idempotency identity
+
+**Decision:** Use the `x-razorpay-event-id` HTTP header as the primary identity for webhook idempotency, mapped to `PaymentEvent.external_event_id`.
+
+**Rationale:** Razorpay guarantees unique event IDs per webhook delivery. This provides a reliable deduplication mechanism that survives network retries and duplicates. The database unique constraint on `external_event_id` is the safety net.
+
+**Consequences:** Duplicate webhook deliveries with the same event ID are acknowledged with `duplicate: true` without creating new records. Race conditions are handled by catching IntegrityError on the unique constraint.
+
+---
+
+## ADR-017: Timing-safe signature comparison
+
+**Decision:** Use `hmac.compare_digest()` for webhook signature verification instead of standard string equality (`==`).
+
+**Rationale:** Standard string comparison short-circuits on the first mismatched character, leaking timing information that could be exploited to guess the correct signature character by character. `hmac.compare_digest()` takes constant time regardless of where the mismatch occurs.
+
+**Consequences:** Signature verification is resistant to timing attacks. The slight performance cost is negligible for webhook processing.
+
+---
+
+## ADR-018: Simulation endpoint isolated from real webhook authentication
+
+**Decision:** The development simulation endpoint (`POST /api/dev/simulate/payment-failed`) does not verify Razorpay webhook signatures, and is disabled outside development/test environments.
+
+**Rationale:** The simulation endpoint exists for local testing and hackathon demos. It is a separate endpoint with its own URL path, not a bypass mode on the real webhook route. Disabling it outside dev/test prevents accidental use in production.
+
+**Consequences:** The simulation endpoint uses the same core ingestion service as the real webhook, ensuring identical persistence behavior. It is clearly documented as a development-only tool.
+
+---
+
+## ADR-019: One payment.failed ingestion creates at most one PaymentEvent and one RecoveryCase
+
+**Decision:** Each successful `payment.failed` webhook ingestion creates exactly one `PaymentEvent` and exactly one `RecoveryCase`, enforced atomically within a single database transaction.
+
+**Rationale:** A single payment failure should produce a single recovery case. Multiple recovery attempts on the same event would create conflicts. Atomicity ensures no orphaned PaymentEvent without a RecoveryCase.
+
+**Consequences:** The ingestion service uses `db.flush()` within a transaction to ensure both records are persisted together. If either operation fails, the entire transaction is rolled back. Duplicate events are detected and handled without creating additional records.

@@ -22,9 +22,13 @@ recoverai/
 The backend is organized into three conceptual engines, each responsible for a distinct phase of the recovery pipeline:
 
 ### 1. Ingestion Engine
-- Receives failed payment events (webhooks, polling, or manual input).
-- Normalizes and validates incoming data.
-- Stores raw events and derived metadata in PostgreSQL.
+- Receives failed payment events via Razorpay webhooks.
+- Verifies HMAC-SHA256 webhook signatures using timing-safe comparison.
+- Uses `x-razorpay-event-id` header for idempotent event processing.
+- Normalizes Razorpay payloads into PaymentEvent-compatible data.
+- Persists PaymentEvent and creates exactly one RecoveryCase per event.
+- Handles duplicate events safely using database-level uniqueness constraints.
+- Provides a development-only simulation endpoint (`POST /api/dev/simulate/payment-failed`).
 
 ### 2. Decision Engine
 - Analyzes failed payment events using deterministic scoring.
@@ -84,9 +88,37 @@ Customer ──< PaymentEvent ──── RecoveryCase ──< ExecutionLog
 - Timestamps are timezone-aware.
 - Primary keys are UUIDs.
 
+## Webhook Ingestion Flow
+
+```
+Razorpay POST /webhooks/razorpay
+        ↓
+Read raw body bytes (no parsing)
+        ↓
+Verify HMAC-SHA256 signature (timing-safe)
+        ↓
+Parse JSON only after verification
+        ↓
+Check event type == payment.failed
+        ↓
+Normalize payload → PaymentEvent columns
+        ↓
+Persist PaymentEvent + RecoveryCase (atomic)
+        ↓
+Return { accepted: true, duplicate: false }
+```
+
+Idempotency is enforced at two levels:
+1. Application-level: check existing external_event_id before insert.
+2. Database-level: unique constraint on `payment_events.external_event_id`.
+
 ## Key Design Constraints
 
-- Idempotency is mandatory before any real execution.
+- Raw body is verified before JSON parsing.
+- `x-razorpay-event-id` is the primary webhook idempotency identity.
+- Signature verification uses timing-safe comparison (`hmac.compare_digest`).
+- Simulation is isolated from real webhook authentication.
+- One successful `payment.failed` ingestion creates at most one PaymentEvent and one RecoveryCase.
 - AI must never directly execute financial actions.
 - The deterministic policy engine has final authority.
 - All actions must be auditable.
