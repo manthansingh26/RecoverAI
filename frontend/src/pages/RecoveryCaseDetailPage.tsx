@@ -26,6 +26,7 @@ import StatusBadge from '../components/StatusBadge';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import Modal from '../components/Modal';
+import RecoveryPipeline from '../components/RecoveryPipeline';
 import { getStrategyLabel } from '../utils/status';
 import {
   formatCurrency,
@@ -181,6 +182,9 @@ export default function RecoveryCaseDetailPage() {
           Created {timeAgo(caseData.created_at)}
         </div>
       </div>
+
+      {/* Recovery Pipeline Visualization */}
+      <RecoveryPipeline caseData={caseData} />
 
       {/* Action result message */}
       {actionResult && (

@@ -1,6 +1,6 @@
 """Pydantic response models for the Recovery Dashboard API."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -165,3 +165,92 @@ class DashboardSummary(BaseModel):
     successful_executions: int = 0
     failed_executions: int = 0
     blocked_executions: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Dashboard analytics (Milestone 9A)
+# ---------------------------------------------------------------------------
+
+class StatusDistributionItem(BaseModel):
+    """Count of recovery cases for a single status value."""
+
+    status: str
+    count: int = 0
+
+
+class StrategyDistributionItem(BaseModel):
+    """Count of recovery cases for a single recommended strategy."""
+
+    strategy: str
+    count: int = 0
+
+
+class RecoveryPerformanceMetrics(BaseModel):
+    """Aggregate recovery performance derived from actual case statuses.
+
+    success_rate is calculated as:
+        successful_cases / (successful_cases + failed_cases) * 100
+    Protected from division-by-zero: returns 0.0 when denominator is 0.
+    """
+
+    total_cases: int = 0
+    successful_cases: int = 0
+    failed_cases: int = 0
+    pending_cases: int = 0
+    human_review_cases: int = 0
+    success_rate: float = Field(
+        default=0.0,
+        description=(
+            "Percentage of resolved cases that were successful. "
+            "Zero when no resolved cases exist."
+        ),
+    )
+
+
+class FinancialMetrics(BaseModel):
+    """Financial impact aggregated from PaymentEvent amounts (in paise).
+
+    All values represent simulated recovery since the project operates
+    in SIMULATION execution mode. Frontend labels must indicate this.
+    """
+
+    total_failed_amount_paise: int = 0
+    simulated_recovered_amount_paise: int = 0
+    pending_recovery_amount_paise: int = 0
+    human_review_amount_paise: int = 0
+
+
+class HumanReviewMetrics(BaseModel):
+    """Human review state counts.
+
+    - awaiting_review: requires_human_approval=True AND approved_by_human IS NULL
+    - approved: approved_by_human=True
+    - rejected: approved_by_human=False
+    """
+
+    awaiting_review: int = 0
+    approved: int = 0
+    rejected: int = 0
+
+
+class DailyActivityItem(BaseModel):
+    """Recovery cases created on a single day."""
+
+    date: date
+    count: int = 0
+
+
+class DashboardAnalytics(BaseModel):
+    """Complete analytics response for the Recovery Intelligence dashboard."""
+
+    status_distribution: list[StatusDistributionItem] = []
+    strategy_distribution: list[StrategyDistributionItem] = []
+    performance: RecoveryPerformanceMetrics = Field(
+        default_factory=RecoveryPerformanceMetrics,
+    )
+    financial: FinancialMetrics = Field(default_factory=FinancialMetrics)
+    human_review: HumanReviewMetrics = Field(
+        default_factory=HumanReviewMetrics,
+    )
+    daily_activity: list[DailyActivityItem] = []
+

@@ -130,6 +130,54 @@ export interface DashboardSummary {
   blocked_executions: number;
 }
 
+// --- Dashboard Analytics (Milestone 9A) ---
+
+export interface StatusDistributionItem {
+  status: string;
+  count: number;
+}
+
+export interface StrategyDistributionItem {
+  strategy: string;
+  count: number;
+}
+
+export interface RecoveryPerformanceMetrics {
+  total_cases: number;
+  successful_cases: number;
+  failed_cases: number;
+  pending_cases: number;
+  human_review_cases: number;
+  success_rate: number;
+}
+
+export interface FinancialMetrics {
+  total_failed_amount_paise: number;
+  simulated_recovered_amount_paise: number;
+  pending_recovery_amount_paise: number;
+  human_review_amount_paise: number;
+}
+
+export interface HumanReviewMetrics {
+  awaiting_review: number;
+  approved: number;
+  rejected: number;
+}
+
+export interface DailyActivityItem {
+  date: string;
+  count: number;
+}
+
+export interface DashboardAnalytics {
+  status_distribution: StatusDistributionItem[];
+  strategy_distribution: StrategyDistributionItem[];
+  performance: RecoveryPerformanceMetrics;
+  financial: FinancialMetrics;
+  human_review: HumanReviewMetrics;
+  daily_activity: DailyActivityItem[];
+}
+
 // --- API Error ---
 
 export interface ApiError {

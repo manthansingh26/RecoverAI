@@ -15,10 +15,10 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, cast, func, select, Date
 from sqlalchemy.orm import Session
 
 from app.models.enums import (
@@ -384,3 +384,193 @@ def get_dashboard_summary(db: Session) -> dict[str, int]:
         "failed_executions": execution_status_counts.get(ExecutionStatus.FAILED.value, 0),
         "blocked_executions": execution_status_counts.get(ExecutionStatus.BLOCKED.value, 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard analytics (Milestone 9A)
+# ---------------------------------------------------------------------------
+
+def get_dashboard_analytics(db: Session) -> dict[str, Any]:
+    """Compute comprehensive analytics from actual database data.
+
+    Uses efficient SQL aggregation queries — no N+1 problems.
+
+    Returns:
+        Dict matching the DashboardAnalytics schema shape.
+    """
+    # ----- 1. Status distribution (GROUP BY) -----
+    status_rows = db.execute(
+        select(
+            RecoveryCase.status,
+            func.count().label("cnt"),
+        )
+        .group_by(RecoveryCase.status)
+    ).all()
+
+    status_distribution = [
+        {"status": row.status, "count": row.cnt}
+        for row in status_rows
+    ]
+
+    # Build a quick lookup for performance metrics
+    status_lookup: dict[str, int] = {row.status: row.cnt for row in status_rows}
+    total_cases = sum(status_lookup.values())
+
+    # ----- 2. Strategy distribution (GROUP BY) -----
+    strategy_rows = db.execute(
+        select(
+            RecoveryCase.recommended_strategy,
+            func.count().label("cnt"),
+        )
+        .where(RecoveryCase.recommended_strategy.is_not(None))
+        .group_by(RecoveryCase.recommended_strategy)
+    ).all()
+
+    strategy_distribution = [
+        {"strategy": row.recommended_strategy, "count": row.cnt}
+        for row in strategy_rows
+    ]
+
+    # ----- 3. Recovery performance metrics -----
+    successful_cases = status_lookup.get(RecoveryStatus.RESOLVED_SUCCESS.value, 0)
+    failed_cases = status_lookup.get(RecoveryStatus.RESOLVED_FAILED.value, 0)
+    human_review_cases = status_lookup.get(RecoveryStatus.REQUIRES_HUMAN.value, 0)
+
+    # Pending = RECEIVED + DECISION_PENDING + PENDING_EXECUTION + EXECUTING
+    pending_cases = sum(
+        status_lookup.get(s.value, 0)
+        for s in (
+            RecoveryStatus.RECEIVED,
+            RecoveryStatus.DECISION_PENDING,
+            RecoveryStatus.PENDING_EXECUTION,
+            RecoveryStatus.EXECUTING,
+        )
+    )
+
+    resolved_total = successful_cases + failed_cases
+    success_rate = (
+        round(successful_cases / resolved_total * 100, 1)
+        if resolved_total > 0
+        else 0.0
+    )
+
+    performance = {
+        "total_cases": total_cases,
+        "successful_cases": successful_cases,
+        "failed_cases": failed_cases,
+        "pending_cases": pending_cases,
+        "human_review_cases": human_review_cases,
+        "success_rate": success_rate,
+    }
+
+    # ----- 4. Financial metrics (JOIN with PaymentEvent) -----
+    # Single query: SUM amounts grouped by case status categories
+    financial_rows = db.execute(
+        select(
+            func.coalesce(func.sum(PaymentEvent.amount_paise), 0).label("total"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            RecoveryCase.status == RecoveryStatus.RESOLVED_SUCCESS.value,
+                            PaymentEvent.amount_paise,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("recovered"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            RecoveryCase.status.in_([
+                                RecoveryStatus.RECEIVED.value,
+                                RecoveryStatus.DECISION_PENDING.value,
+                                RecoveryStatus.PENDING_EXECUTION.value,
+                                RecoveryStatus.EXECUTING.value,
+                            ]),
+                            PaymentEvent.amount_paise,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pending"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            RecoveryCase.status == RecoveryStatus.REQUIRES_HUMAN.value,
+                            PaymentEvent.amount_paise,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("human_review"),
+        )
+        .select_from(RecoveryCase)
+        .join(PaymentEvent, RecoveryCase.payment_event_id == PaymentEvent.id)
+    ).one()
+
+    financial = {
+        "total_failed_amount_paise": int(financial_rows.total),
+        "simulated_recovered_amount_paise": int(financial_rows.recovered),
+        "pending_recovery_amount_paise": int(financial_rows.pending),
+        "human_review_amount_paise": int(financial_rows.human_review),
+    }
+
+    # ----- 5. Human review metrics -----
+    awaiting_review = db.execute(
+        select(func.count()).select_from(RecoveryCase).where(
+            RecoveryCase.requires_human_approval == True,  # noqa: E712
+            RecoveryCase.approved_by_human.is_(None),
+        )
+    ).scalar() or 0
+
+    approved = db.execute(
+        select(func.count()).select_from(RecoveryCase).where(
+            RecoveryCase.approved_by_human == True,  # noqa: E712
+        )
+    ).scalar() or 0
+
+    rejected = db.execute(
+        select(func.count()).select_from(RecoveryCase).where(
+            RecoveryCase.approved_by_human == False,  # noqa: E712
+        )
+    ).scalar() or 0
+
+    human_review = {
+        "awaiting_review": awaiting_review,
+        "approved": approved,
+        "rejected": rejected,
+    }
+
+    # ----- 6. Daily activity (last 30 days) -----
+    thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+
+    daily_rows = db.execute(
+        select(
+            cast(RecoveryCase.created_at, Date).label("day"),
+            func.count().label("cnt"),
+        )
+        .where(RecoveryCase.created_at >= thirty_days_ago)
+        .group_by("day")
+        .order_by("day")
+    ).all()
+
+    daily_activity = [
+        {"date": row.day, "count": row.cnt}
+        for row in daily_rows
+    ]
+
+    return {
+        "status_distribution": status_distribution,
+        "strategy_distribution": strategy_distribution,
+        "performance": performance,
+        "financial": financial,
+        "human_review": human_review,
+        "daily_activity": daily_activity,
+    }
+
