@@ -254,3 +254,28 @@ class DashboardAnalytics(BaseModel):
     )
     daily_activity: list[DailyActivityItem] = []
 
+
+# ---------------------------------------------------------------------------
+# Live Activity Feed (Milestone 9B)
+# ---------------------------------------------------------------------------
+
+class ActivityItem(BaseModel):
+    """Single activity item derived from RecoveryCase, ExecutionLog, or PaymentEvent."""
+
+    id: str
+    type: str
+    title: str
+    description: str
+    occurred_at: datetime
+    recovery_case_id: str | None = None
+    payment_id: str | None = None
+    status: str | None = None
+    strategy: str | None = None
+    amount_paise: int | None = None
+
+
+class ActivityFeed(BaseModel):
+    """Live activity feed response."""
+
+    items: list[ActivityItem] = []
+    generated_at: datetime

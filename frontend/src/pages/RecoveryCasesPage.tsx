@@ -2,12 +2,13 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-react';
 import { listRecoveryCases } from '../api/recoveryCases';
-import { useApi } from '../hooks/useApi';
+import { usePolling } from '../hooks/usePolling';
 import PageHeader from '../components/PageHeader';
 import StatusBadge from '../components/StatusBadge';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import EmptyState from '../components/EmptyState';
+import LiveStatusIndicator from '../components/LiveStatusIndicator';
 import { getStrategyLabel } from '../utils/status';
 import { formatDate } from '../utils/format';
 
@@ -38,7 +39,14 @@ export default function RecoveryCasesPage() {
   const [strategyFilter, setStrategyFilter] = useState('');
   const pageSize = 20;
 
-  const { data, loading, error, refetch } = useApi(
+  const {
+    data,
+    loading,
+    error,
+    lastUpdated,
+    pollingStatus,
+    refetch,
+  } = usePolling(
     () =>
       listRecoveryCases({
         status: statusFilter || undefined,
@@ -47,6 +55,7 @@ export default function RecoveryCasesPage() {
         page_size: pageSize,
       }),
     [page, statusFilter, strategyFilter],
+    { intervalMs: 15000 },
   );
 
   const handleStatusChange = (value: string) => {
@@ -68,7 +77,14 @@ export default function RecoveryCasesPage() {
         title="Recovery Cases"
         description="Monitor and manage payment recovery cases"
         onRefresh={refetch}
-        loading={loading}
+        loading={pollingStatus === 'refreshing'}
+        actions={
+          <LiveStatusIndicator
+            status={pollingStatus}
+            lastUpdated={lastUpdated}
+            intervalSec={15}
+          />
+        }
       />
 
       {/* Filters */}

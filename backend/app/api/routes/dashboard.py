@@ -2,12 +2,20 @@
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas.recovery_case import DashboardAnalytics, DashboardSummary
-from app.services.recovery_review import get_dashboard_analytics, get_dashboard_summary
+from app.schemas.recovery_case import (
+    ActivityFeed,
+    DashboardAnalytics,
+    DashboardSummary,
+)
+from app.services.recovery_review import (
+    get_dashboard_activity,
+    get_dashboard_analytics,
+    get_dashboard_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,3 +47,16 @@ async def dashboard_analytics(
     """
     analytics = get_dashboard_analytics(db)
     return DashboardAnalytics(**analytics)
+
+
+@router.get("/api/dashboard/activity")
+async def dashboard_activity(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> ActivityFeed:
+    """Get live recovery activity feed derived from real database records.
+
+    Returns deterministic chronologically sorted activity items with stable IDs.
+    """
+    activity_data = get_dashboard_activity(db, limit=limit)
+    return ActivityFeed(**activity_data)

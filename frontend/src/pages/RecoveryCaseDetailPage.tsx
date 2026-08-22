@@ -15,18 +15,14 @@ import {
   RotateCcw,
   FileText,
 } from 'lucide-react';
-import {
-  getRecoveryCase,
-  approveCase,
-  rejectCase,
-  executeCase,
-} from '../api/recoveryCases';
-import { useApi } from '../hooks/useApi';
+import { getRecoveryCase, approveCase, rejectCase, executeCase } from '../api/recoveryCases';
+import { usePolling } from '../hooks/usePolling';
 import StatusBadge from '../components/StatusBadge';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import Modal from '../components/Modal';
 import RecoveryPipeline from '../components/RecoveryPipeline';
+import LiveStatusIndicator from '../components/LiveStatusIndicator';
 import { getStrategyLabel } from '../utils/status';
 import {
   formatCurrency,
@@ -38,12 +34,30 @@ export default function RecoveryCaseDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
 
+  const [activeStatus, setActiveStatus] = useState<string | null>(null);
+  const isCaseActive = activeStatus === null || !['RESOLVED_SUCCESS', 'RESOLVED_FAILED'].includes(activeStatus);
+
   const {
     data: caseData,
     loading,
     error,
+    lastUpdated,
+    pollingStatus,
     refetch,
-  } = useApi(() => getRecoveryCase(id!), [id]);
+  } = usePolling(
+    async () => {
+      const data = await getRecoveryCase(id!);
+      if (data) {
+        setActiveStatus(data.status);
+      }
+      return data;
+    },
+    [id],
+    {
+      intervalMs: 10000,
+      enabled: isCaseActive,
+    },
+  );
 
   const [approveModalOpen, setApproveModalOpen] = useState(false);
   const [rejectModalOpen, setRejectModalOpen] = useState(false);
@@ -177,9 +191,16 @@ export default function RecoveryCaseDetailPage() {
             {caseData.recovery_case_id}
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-text-muted">
-          <Clock className="h-3.5 w-3.5" />
-          Created {timeAgo(caseData.created_at)}
+        <div className="flex flex-wrap items-center gap-3">
+          <LiveStatusIndicator
+            status={isCaseActive ? pollingStatus : 'idle'}
+            lastUpdated={lastUpdated}
+            intervalSec={10}
+          />
+          <div className="flex items-center gap-2 text-xs text-text-muted">
+            <Clock className="h-3.5 w-3.5" />
+            Created {timeAgo(caseData.created_at)}
+          </div>
         </div>
       </div>
 

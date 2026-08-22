@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import case, cast, func, select, Date
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models.enums import (
     ExecutionStatus,
@@ -574,3 +574,182 @@ def get_dashboard_analytics(db: Session) -> dict[str, Any]:
         "daily_activity": daily_activity,
     }
 
+
+# ---------------------------------------------------------------------------
+# Live Activity Feed (Milestone 9B)
+# ---------------------------------------------------------------------------
+
+def get_dashboard_activity(db: Session, limit: int = 20) -> dict[str, Any]:
+    """Compute real activity feed from ExecutionLog, RecoveryCase, and PaymentEvent records.
+
+    Derives timeline events without fabricating data or using extra tables.
+    Uses eager loading (joinedload) to eliminate N+1 queries.
+
+    Args:
+        db: Active database session.
+        limit: Maximum number of activity items to return (1-100).
+
+    Returns:
+        Dict matching ActivityFeed schema with items and generated_at.
+    """
+    activities: list[dict[str, Any]] = []
+
+    # 1. Fetch recent execution logs with joined recovery case & payment event
+    exec_logs = (
+        db.execute(
+            select(ExecutionLog)
+            .options(
+                joinedload(ExecutionLog.recovery_case).joinedload(RecoveryCase.payment_event)
+            )
+            .order_by(ExecutionLog.created_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .unique()
+        .all()
+    )
+
+    for log in exec_logs:
+        rc = log.recovery_case
+        pe = rc.payment_event if rc else None
+        action_label = (log.action or "").replace("_", " ").title()
+        occurred_at = log.executed_at or log.created_at
+
+        if log.status == ExecutionStatus.SUCCESS.value:
+            activity_type = "EXECUTION_SUCCESS"
+            title = "Recovery Execution Succeeded"
+            desc = f"Strategy '{action_label}' executed successfully in simulation"
+        elif log.status == ExecutionStatus.FAILED.value:
+            activity_type = "EXECUTION_FAILED"
+            title = "Recovery Execution Failed"
+            error_suffix = f": {log.error_message}" if log.error_message else ""
+            desc = f"Strategy '{action_label}' execution failed{error_suffix}"
+        elif log.status == ExecutionStatus.BLOCKED.value:
+            activity_type = "EXECUTION_BLOCKED"
+            title = "Recovery Blocked"
+            desc = f"Strategy '{action_label}' blocked by safety guardrails"
+        else:  # PENDING
+            activity_type = "EXECUTION_PENDING"
+            title = "Recovery Initiated"
+            desc = f"Strategy '{action_label}' scheduled in simulation mode"
+
+        activities.append({
+            "id": f"exec_{log.id}",
+            "type": activity_type,
+            "title": title,
+            "description": desc,
+            "occurred_at": occurred_at,
+            "recovery_case_id": str(rc.id) if rc else None,
+            "payment_id": pe.external_payment_id if pe else None,
+            "status": rc.status if rc else None,
+            "strategy": log.action,
+            "amount_paise": pe.amount_paise if pe else None,
+        })
+
+    # 2. Fetch recent recovery cases with joined payment event
+    cases = (
+        db.execute(
+            select(RecoveryCase)
+            .options(joinedload(RecoveryCase.payment_event))
+            .order_by(RecoveryCase.created_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .unique()
+        .all()
+    )
+
+    for rc in cases:
+        pe = rc.payment_event
+        amount_str = f" of ₹{pe.amount_paise / 100:,.2f}" if pe and pe.amount_paise else ""
+
+        # Case Ingestion / Creation
+        activities.append({
+            "id": f"case_created_{rc.id}",
+            "type": "CASE_CREATED",
+            "title": "Payment Failure Ingested",
+            "description": f"Failure event received for payment{amount_str}",
+            "occurred_at": rc.created_at,
+            "recovery_case_id": str(rc.id),
+            "payment_id": pe.external_payment_id if pe else None,
+            "status": rc.status,
+            "strategy": rc.recommended_strategy,
+            "amount_paise": pe.amount_paise if pe else None,
+        })
+
+        # Strategy Assigned (if classified and recommended)
+        if rc.recommended_strategy and rc.status != RecoveryStatus.RECEIVED.value:
+            strat_label = rc.recommended_strategy.replace("_", " ").title()
+            prob_str = f" ({int(float(rc.recovery_probability) * 100)}% recovery confidence)" if rc.recovery_probability is not None else ""
+            activities.append({
+                "id": f"case_strategy_{rc.id}",
+                "type": "STRATEGY_ASSIGNED",
+                "title": "Recovery Strategy Selected",
+                "description": f"Decision engine recommended '{strat_label}'{prob_str}",
+                "occurred_at": rc.updated_at or rc.created_at,
+                "recovery_case_id": str(rc.id),
+                "payment_id": pe.external_payment_id if pe else None,
+                "status": rc.status,
+                "strategy": rc.recommended_strategy,
+                "amount_paise": pe.amount_paise if pe else None,
+            })
+
+        # Human Review State (if applicable)
+        if rc.requires_human_approval and rc.approved_by_human is None and rc.status == RecoveryStatus.REQUIRES_HUMAN.value:
+            activities.append({
+                "id": f"case_review_req_{rc.id}",
+                "type": "HUMAN_REVIEW_REQUIRED",
+                "title": "Human Review Required",
+                "description": f"High value or policy flag requires operator approval{amount_str}",
+                "occurred_at": rc.updated_at or rc.created_at,
+                "recovery_case_id": str(rc.id),
+                "payment_id": pe.external_payment_id if pe else None,
+                "status": rc.status,
+                "strategy": rc.recommended_strategy,
+                "amount_paise": pe.amount_paise if pe else None,
+            })
+        elif rc.approved_by_human is True:
+            activities.append({
+                "id": f"case_review_app_{rc.id}",
+                "type": "HUMAN_REVIEW_APPROVED",
+                "title": "Human Review Approved",
+                "description": "Operator approved case for automated execution",
+                "occurred_at": rc.updated_at or rc.created_at,
+                "recovery_case_id": str(rc.id),
+                "payment_id": pe.external_payment_id if pe else None,
+                "status": rc.status,
+                "strategy": rc.recommended_strategy,
+                "amount_paise": pe.amount_paise if pe else None,
+            })
+        elif rc.approved_by_human is False:
+            activities.append({
+                "id": f"case_review_rej_{rc.id}",
+                "type": "HUMAN_REVIEW_REJECTED",
+                "title": "Human Review Rejected",
+                "description": "Operator rejected recovery; case permanently stopped",
+                "occurred_at": rc.updated_at or rc.created_at,
+                "recovery_case_id": str(rc.id),
+                "payment_id": pe.external_payment_id if pe else None,
+                "status": rc.status,
+                "strategy": rc.recommended_strategy,
+                "amount_paise": pe.amount_paise if pe else None,
+            })
+
+    # Deduplicate by ID
+    seen_ids: set[str] = set()
+    unique_activities: list[dict[str, Any]] = []
+    for act in activities:
+        if act["id"] not in seen_ids:
+            seen_ids.add(act["id"])
+            unique_activities.append(act)
+
+    # Sort globally by occurred_at descending (with ID for stable tie-breaking)
+    unique_activities.sort(
+        key=lambda x: (x["occurred_at"], x["id"]),
+        reverse=True,
+    )
+
+    return {
+        "items": unique_activities[:limit],
+        "generated_at": datetime.now(timezone.utc),
+    }

@@ -178,6 +178,26 @@ export interface DashboardAnalytics {
   daily_activity: DailyActivityItem[];
 }
 
+// --- Live Activity Feed (Milestone 9B) ---
+
+export interface ActivityItem {
+  id: string;
+  type: string;
+  title: string;
+  description: string;
+  occurred_at: string;
+  recovery_case_id: string | null;
+  payment_id: string | null;
+  status: string | null;
+  strategy: string | null;
+  amount_paise: number | null;
+}
+
+export interface ActivityFeed {
+  items: ActivityItem[];
+  generated_at: string;
+}
+
 // --- API Error ---
 
 export interface ApiError {

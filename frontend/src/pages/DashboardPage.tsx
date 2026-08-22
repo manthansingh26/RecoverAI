@@ -31,13 +31,24 @@ import {
   AreaChart,
   Area,
 } from 'recharts';
-import { fetchDashboardSummary, fetchDashboardAnalytics } from '../api/dashboard';
-import { useApi } from '../hooks/useApi';
+import {
+  fetchDashboardSummary,
+  fetchDashboardAnalytics,
+  fetchDashboardActivity,
+} from '../api/dashboard';
+import { usePolling } from '../hooks/usePolling';
+import type {
+  ActivityFeed as ActivityFeedType,
+  DashboardAnalytics as DashboardAnalyticsType,
+  DashboardSummary as DashboardSummaryType,
+} from '../types';
 import PageHeader from '../components/PageHeader';
 import SummaryCard from '../components/SummaryCard';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import SimulationModal from '../components/SimulationModal';
+import LiveStatusIndicator from '../components/LiveStatusIndicator';
+import ActivityFeed from '../components/ActivityFeed';
 import { formatCurrency } from '../utils/format';
 import { getStatusLabel, getStrategyLabel } from '../utils/status';
 
@@ -67,6 +78,12 @@ function getStatusColor(status: string): string {
 
 function getStrategyColor(strategy: string): string {
   return STRATEGY_COLORS[strategy] ?? '#6b7280';
+}
+
+interface CombinedDashboardData {
+  summary: DashboardSummaryType;
+  analytics: DashboardAnalyticsType;
+  activity: ActivityFeedType;
 }
 
 // --- Custom Recharts tooltip ---
@@ -204,82 +221,97 @@ function ChartEmptyState({ message }: { message?: string }) {
 }
 
 export default function DashboardPage() {
-  const { data, loading, error, refetch } = useApi(
-    () => fetchDashboardSummary(),
-    [],
-  );
+  const fetchAll = useCallback(async (): Promise<CombinedDashboardData> => {
+    const [summary, analytics, activity] = await Promise.all([
+      fetchDashboardSummary(),
+      fetchDashboardAnalytics(),
+      fetchDashboardActivity(25),
+    ]);
+    return { summary, analytics, activity };
+  }, []);
+
   const {
-    data: analytics,
-    loading: analyticsLoading,
-    error: analyticsError,
-    refetch: refetchAnalytics,
-  } = useApi(() => fetchDashboardAnalytics(), []);
+    data,
+    loading,
+    error,
+    lastUpdated,
+    pollingStatus,
+    refetch,
+  } = usePolling(fetchAll, [], { intervalMs: 15000 });
 
   const [simulationOpen, setSimulationOpen] = useState(false);
 
   const handleSimulationSuccess = useCallback(() => {
     refetch();
-    refetchAnalytics();
-  }, [refetch, refetchAnalytics]);
+  }, [refetch]);
 
-  const handleRefresh = useCallback(() => {
-    refetch();
-    refetchAnalytics();
-  }, [refetch, refetchAnalytics]);
+  const summary = data?.summary;
+  const analytics = data?.analytics;
+  const activityItems = data?.activity?.items ?? [];
 
-  const isLoading = loading || analyticsLoading;
+  const hasCases = summary && summary.total_cases > 0;
   const hasAnalytics = analytics && analytics.performance.total_cases > 0;
 
   // Prepare chart data
-  const statusChartData = analytics?.status_distribution
-    .filter((item) => item.count > 0)
-    .map((item) => ({
-      name: getStatusLabel(item.status),
-      value: item.count,
-      status: item.status,
-    })) ?? [];
+  const statusChartData =
+    analytics?.status_distribution
+      .filter((item) => item.count > 0)
+      .map((item) => ({
+        name: getStatusLabel(item.status),
+        value: item.count,
+        status: item.status,
+      })) ?? [];
 
-  const strategyChartData = analytics?.strategy_distribution
-    .filter((item) => item.count > 0)
-    .map((item) => ({
-      name: getStrategyLabel(item.strategy),
-      value: item.count,
-      strategy: item.strategy,
-    })) ?? [];
+  const strategyChartData =
+    analytics?.strategy_distribution
+      .filter((item) => item.count > 0)
+      .map((item) => ({
+        name: getStrategyLabel(item.strategy),
+        value: item.count,
+        strategy: item.strategy,
+      })) ?? [];
 
-  const activityChartData = analytics?.daily_activity.map((item) => ({
-    date: new Date(item.date).toLocaleDateString('en-IN', {
-      month: 'short',
-      day: 'numeric',
-    }),
-    count: item.count,
-  })) ?? [];
+  const activityChartData =
+    analytics?.daily_activity.map((item) => ({
+      date: new Date(item.date).toLocaleDateString('en-IN', {
+        month: 'short',
+        day: 'numeric',
+      }),
+      count: item.count,
+    })) ?? [];
 
   return (
     <div>
       <PageHeader
         title="Dashboard"
-        description="Recovery Intelligence & Operations Overview"
-        onRefresh={handleRefresh}
-        loading={isLoading}
+        description="Live Recovery Intelligence & Operations"
+        onRefresh={refetch}
+        loading={pollingStatus === 'refreshing'}
         actions={
-          <button
-            onClick={() => setSimulationOpen(true)}
-            className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
-          >
-            <Sparkles className="h-3.5 w-3.5" />
-            Simulate Payment Failure
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <LiveStatusIndicator
+              status={pollingStatus}
+              lastUpdated={lastUpdated}
+              intervalSec={15}
+            />
+            <button
+              onClick={() => setSimulationOpen(true)}
+              className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              Simulate Payment Failure
+            </button>
+          </div>
         }
       />
 
-      {loading && <LoadingSpinner text="Loading dashboard metrics..." />}
+      {loading && <LoadingSpinner text="Loading live recovery operations..." />}
 
-      {error && <ErrorMessage message={error} onRetry={handleRefresh} />}
+      {error && !data && <ErrorMessage message={error} onRetry={refetch} />}
 
-      {data && (
+      {data && summary && (
         <>
-          {data.total_cases === 0 && !analyticsLoading ? (
+          {!hasCases ? (
             <div className="flex flex-col items-center justify-center gap-6 rounded-xl border border-border bg-bg-card py-20 px-6">
               <div className="flex h-16 w-16 items-center justify-center rounded-full bg-accent-blue/10">
                 <BarChart3 className="h-8 w-8 text-accent-blue/60" />
@@ -312,49 +344,49 @@ export default function DashboardPage() {
               <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 <SummaryCard
                   title="Total Cases"
-                  value={data.total_cases}
+                  value={summary.total_cases}
                   icon={FolderSearch}
                   color="text-accent-blue"
                 />
                 <SummaryCard
                   title="Received"
-                  value={data.received_cases}
+                  value={summary.received_cases}
                   icon={FolderSearch}
                   color="text-blue-400"
                 />
                 <SummaryCard
                   title="Pending Execution"
-                  value={data.pending_execution_cases}
+                  value={summary.pending_execution_cases}
                   icon={Clock}
                   color="text-amber-400"
                 />
                 <SummaryCard
                   title="Requires Human Review"
-                  value={data.requires_human_cases}
+                  value={summary.requires_human_cases}
                   icon={UserCheck}
                   color="text-purple-400"
                 />
                 <SummaryCard
                   title="Awaiting Human Review"
-                  value={data.awaiting_human_review}
+                  value={summary.awaiting_human_review}
                   icon={Clock}
                   color="text-purple-300"
                 />
                 <SummaryCard
                   title="Approved"
-                  value={data.approved_cases}
+                  value={summary.approved_cases}
                   icon={CheckCircle2}
                   color="text-green-400"
                 />
                 <SummaryCard
                   title="Resolved Success"
-                  value={data.resolved_success_cases}
+                  value={summary.resolved_success_cases}
                   icon={CheckCircle2}
                   color="text-green-500"
                 />
                 <SummaryCard
                   title="Resolved Failed"
-                  value={data.resolved_failed_cases}
+                  value={summary.resolved_failed_cases}
                   icon={XCircle}
                   color="text-red-400"
                 />
@@ -369,44 +401,42 @@ export default function DashboardPage() {
               <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <SummaryCard
                   title="Total Executions"
-                  value={data.total_execution_attempts}
+                  value={summary.total_execution_attempts}
                   icon={Activity}
                   color="text-accent-cyan"
                 />
                 <SummaryCard
                   title="Successful"
-                  value={data.successful_executions}
+                  value={summary.successful_executions}
                   icon={PlayCircle}
                   color="text-green-400"
                 />
                 <SummaryCard
                   title="Failed"
-                  value={data.failed_executions}
+                  value={summary.failed_executions}
                   icon={XCircle}
                   color="text-red-400"
                 />
                 <SummaryCard
                   title="Blocked"
-                  value={data.blocked_executions}
+                  value={summary.blocked_executions}
                   icon={Ban}
                   color="text-gray-400"
                 />
               </div>
 
-              {/* ======= ANALYTICS ======= */}
-              {analyticsLoading && (
-                <LoadingSpinner text="Loading analytics..." />
-              )}
-              {analyticsError && (
-                <ErrorMessage
-                  message={analyticsError}
-                  onRetry={refetchAnalytics}
+              {/* ======= SECTION 3: Live Recovery Activity Feed ======= */}
+              <div className="mb-8">
+                <ActivityFeed
+                  items={activityItems}
+                  onSimulateClick={() => setSimulationOpen(true)}
                 />
-              )}
+              </div>
 
+              {/* ======= ANALYTICS ======= */}
               {hasAnalytics && analytics && (
                 <>
-                  {/* ======= SECTION 3: Recovery Intelligence ======= */}
+                  {/* ======= SECTION 4: Recovery Intelligence ======= */}
                   <AnalyticsSection
                     icon={PieChartIcon}
                     title="Recovery Intelligence"
@@ -528,7 +558,7 @@ export default function DashboardPage() {
                     </div>
                   </AnalyticsSection>
 
-                  {/* ======= SECTION 4: Recovery Performance ======= */}
+                  {/* ======= SECTION 5: Recovery Performance ======= */}
                   <AnalyticsSection
                     icon={TrendingUp}
                     title="Recovery Performance"
@@ -570,7 +600,7 @@ export default function DashboardPage() {
                     </div>
                   </AnalyticsSection>
 
-                  {/* ======= SECTION 5: Simulated Financial Impact ======= */}
+                  {/* ======= SECTION 6: Simulated Financial Impact ======= */}
                   <AnalyticsSection
                     icon={DollarSign}
                     title="Simulated Financial Impact"
@@ -611,7 +641,7 @@ export default function DashboardPage() {
                     </div>
                   </AnalyticsSection>
 
-                  {/* ======= SECTION 6: Human Review Intelligence ======= */}
+                  {/* ======= SECTION 7: Human Review Intelligence ======= */}
                   <AnalyticsSection
                     icon={ShieldCheck}
                     title="Human Review Intelligence"
@@ -653,7 +683,7 @@ export default function DashboardPage() {
                     </div>
                   </AnalyticsSection>
 
-                  {/* ======= SECTION 7: Activity Timeline ======= */}
+                  {/* ======= SECTION 8: Activity Timeline ======= */}
                   <AnalyticsSection
                     icon={CalendarDays}
                     title="Last 30 Days Recovery Activity"
