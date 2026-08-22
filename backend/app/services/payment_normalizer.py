@@ -49,14 +49,29 @@ def normalize_payment_failed(
     if not event_type:
         raise ValueError("Missing 'event' field in payload")
 
-    # Extract payment object from payload
-    payment = payload_data.get("payload", {})
-    if not isinstance(payment, dict):
+    # Extract payment object from payload.
+    # Real Razorpay webhooks nest the payment data under:
+    #   payload.payment.entity
+    # while the existing simulation format uses:
+    #   payload.payment
+    # (fields like amount, id, etc. directly on payload.payment)
+    #
+    # We prefer the real Razorpay structure when the "entity" key exists
+    # and is a dict (matching Razorpay's published webhook schema).
+    payload_section = payload_data.get("payload", {})
+    if not isinstance(payload_section, dict):
         raise ValueError("Missing or invalid 'payload' in event data")
 
-    payment_obj = payment.get("payment", {})
-    if not isinstance(payment_obj, dict):
+    payment_wrapper = payload_section.get("payment", {})
+    if not isinstance(payment_wrapper, dict):
         raise ValueError("Missing or invalid 'payload.payment' object")
+
+    # Real Razorpay shape: payload.payment.entity contains the actual fields
+    if "entity" in payment_wrapper and isinstance(payment_wrapper["entity"], dict):
+        payment_obj = payment_wrapper["entity"]
+    else:
+        # Simulation / existing test shape: fields directly on payload.payment
+        payment_obj = payment_wrapper
 
     # amount_paise: Razorpay amount is in paise (smallest currency unit)
     amount = payment_obj.get("amount")

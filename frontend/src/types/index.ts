@@ -250,3 +250,94 @@ export interface SimulationResult {
   message: string;
   duplicate: boolean;
 }
+
+// --- Razorpay Payment & Checkout ---
+
+export interface CreateOrderRequest {
+  amount: number;
+  amount_in_rupees?: boolean;
+  currency?: string;
+  receipt?: string;
+  notes?: Record<string, string>;
+}
+
+export interface CreateOrderResponse {
+  key_id: string;
+  order_id: string;
+  amount: number;
+  currency: string;
+  receipt?: string | null;
+}
+
+export interface RazorpayPaymentSuccessResponse {
+  razorpay_payment_id: string;
+  razorpay_order_id: string;
+  razorpay_signature: string;
+}
+
+export interface RazorpayPaymentErrorResponse {
+  error: {
+    code: string;
+    description: string;
+    source: string;
+    step: string;
+    reason: string;
+    metadata: {
+      order_id: string;
+      payment_id?: string;
+    };
+  };
+}
+
+export interface RazorpayCheckoutOptions {
+  key: string;
+  amount: number;
+  currency: string;
+  name: string;
+  description?: string;
+  image?: string;
+  order_id: string;
+  handler?: (response: RazorpayPaymentSuccessResponse) => void;
+  prefill?: {
+    name?: string;
+    email?: string;
+    contact?: string;
+    method?: string;
+  };
+  notes?: Record<string, string>;
+  theme?: {
+    color?: string;
+    backdrop_color?: string;
+    hide_topbar?: boolean;
+  };
+  modal?: {
+    backdropclose?: boolean;
+    escape?: boolean;
+    handleback?: boolean;
+    confirm_close?: boolean;
+    ondismiss?: () => void;
+    animation?: boolean;
+  };
+  retry?: {
+    enabled?: boolean;
+    max_count?: number;
+  };
+}
+
+export interface RazorpayInstance {
+  open(): void;
+  on(
+    event: 'payment.failed',
+    handler: (response: RazorpayPaymentErrorResponse) => void,
+  ): void;
+}
+
+export interface RazorpayConstructor {
+  new (options: RazorpayCheckoutOptions): RazorpayInstance;
+}
+
+declare global {
+  interface Window {
+    Razorpay?: RazorpayConstructor;
+  }
+}

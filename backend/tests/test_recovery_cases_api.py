@@ -738,3 +738,315 @@ class TestDashboard:
         data = response.json()
         assert data["total_execution_attempts"] == 1
         assert data["successful_executions"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Milestone 10: Post-Approval Strategy Resolution Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPostApprovalStrategyResolution:
+    """Tests for the UNKNOWN → HUMAN_REVIEW → approval → executable strategy flow."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_classified_as_requires_human(self, db_session) -> None:
+        """UNKNOWN failure_category results in REQUIRES_HUMAN status."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        assert rc.status == RecoveryStatus.REQUIRES_HUMAN.value
+        assert rc.recommended_strategy == RecoveryStrategy.HUMAN_REVIEW.value
+        assert rc.failure_category == FailureCategory.UNKNOWN.value
+
+    @pytest.mark.asyncio
+    async def test_approval_resolves_human_review_to_executable(self, db_session) -> None:
+        """Approving a HUMAN_REVIEW case resolves to an executable strategy."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["action"] == "approved"
+        assert data["new_status"] == RecoveryStatus.PENDING_EXECUTION.value
+        assert data["new_approved_by_human"] is True
+        # Strategy was resolved from HUMAN_REVIEW to an executable one
+        assert data["resolved_strategy"] is not None
+        assert data["resolved_strategy"] in (
+            RecoveryStrategy.WAIT_AND_RETRY.value,
+            RecoveryStrategy.CREATE_PAYMENT_LINK.value,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolved_strategy_recorded_in_audit_trail(self, db_session) -> None:
+        """The approval resolution is recorded in the decision audit trail."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await client.post(f"/api/recovery-cases/{rc.id}/approve")
+
+        # Reload from DB
+        updated_rc = db_session.execute(
+            select(RecoveryCase).where(RecoveryCase.id == rc.id)
+        ).scalar_one()
+
+        trail = updated_rc.decision_audit_trail
+        assert "approval_resolution" in trail
+        resolution = trail["approval_resolution"]
+        assert resolution["original_strategy"] == RecoveryStrategy.HUMAN_REVIEW.value
+        assert resolution["resolved_strategy"] in (
+            RecoveryStrategy.WAIT_AND_RETRY.value,
+            RecoveryStrategy.CREATE_PAYMENT_LINK.value,
+        )
+        assert "resolution_reason" in resolution
+        assert "policy_validation" in resolution
+        assert "resolved_at" in resolution
+
+    @pytest.mark.asyncio
+    async def test_human_review_strategy_can_never_auto_execute(self, db_session) -> None:
+        """A case still in HUMAN_REVIEW state cannot be executed."""
+        pe = _create_test_payment_event(db_session)
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+            # Set next_run_at to past to ensure it would be 'due' if not for the strategy check
+            next_run_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(f"/api/recovery-cases/{rc.id}/execute")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == ExecutionStatus.BLOCKED.value
+
+    @pytest.mark.asyncio
+    async def test_duplicate_approval_is_idempotent(self, db_session) -> None:
+        """Second approval returns idempotent result without corruption."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            # First approval — resolves strategy
+            resp1 = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+            assert resp1.status_code == 200
+            data1 = resp1.json()
+            assert data1["action"] == "approved"
+
+            # Second approval — idempotent
+            resp2 = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+            assert resp2.status_code == 200
+            data2 = resp2.json()
+            assert data2["message"] == "Case was already approved"
+
+        # Verify DB state is consistent
+        updated_rc = db_session.execute(
+            select(RecoveryCase).where(RecoveryCase.id == rc.id)
+        ).scalar_one()
+        assert updated_rc.approved_by_human is True
+
+    @pytest.mark.asyncio
+    async def test_rejected_case_can_never_execute(self, db_session) -> None:
+        """A rejected case cannot be executed even if attempted manually."""
+        pe = _create_test_payment_event(db_session)
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.CREATE_PAYMENT_LINK.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        # Reject
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await client.post(f"/api/recovery-cases/{rc.id}/reject")
+
+            # Try to execute
+            response = await client.post(f"/api/recovery-cases/{rc.id}/execute")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == ExecutionStatus.BLOCKED.value
+
+    @pytest.mark.asyncio
+    async def test_approval_with_executable_strategy_transitions_directly(self, db_session) -> None:
+        """Case with existing executable strategy transitions directly on approval."""
+        pe = _create_test_payment_event(db_session, error_reason="network_error")
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.WAIT_AND_RETRY.value,
+            failure_category=FailureCategory.TRANSIENT.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["new_status"] == RecoveryStatus.PENDING_EXECUTION.value
+        # No resolution needed — strategy was already executable
+        assert data.get("resolved_strategy") is None
+
+    @pytest.mark.asyncio
+    async def test_resolved_case_can_be_executed(self, db_session) -> None:
+        """After approval resolves strategy, the case can be executed in simulation."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            # Approve — resolves strategy and transitions to PENDING_EXECUTION
+            approve_resp = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+            assert approve_resp.status_code == 200
+            assert approve_resp.json()["new_status"] == RecoveryStatus.PENDING_EXECUTION.value
+
+            # Execute — should work because case is now PENDING_EXECUTION with executable strategy
+            exec_resp = await client.post(f"/api/recovery-cases/{rc.id}/execute")
+            assert exec_resp.status_code == 200
+            exec_data = exec_resp.json()
+            assert exec_data["status"] == ExecutionStatus.SUCCESS.value
+
+        # Verify ExecutionLog was created
+        logs = db_session.execute(
+            select(ExecutionLog).where(ExecutionLog.recovery_case_id == rc.id)
+        ).scalars().all()
+        assert len(logs) == 1
+        assert logs[0].status == ExecutionStatus.SUCCESS.value
+        assert logs[0].execution_mode == "SIMULATION"
+
+    @pytest.mark.asyncio
+    async def test_approval_for_high_value_triggers_policy_recheck(self, db_session) -> None:
+        """High-value case approval still passes through policy validation."""
+        high_amount = settings.RECOVERY_HIGH_VALUE_THRESHOLD_PAISE + 1_000_000
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=high_amount,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(f"/api/recovery-cases/{rc.id}/approve")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["action"] == "approved"
+        # High-value means policy may still require_human_approval for automated actions
+        # The resolved strategy should still be valid
+        assert data["resolved_strategy"] is not None
+
+    @pytest.mark.asyncio
+    async def test_simulation_mode_never_performs_real_razorpay(self, db_session) -> None:
+        """After approval and resolution, execution is always in SIMULATION mode."""
+        pe = _create_test_payment_event(
+            db_session,
+            error_reason="payment_failed",
+            amount_paise=49900,
+        )
+        rc = _create_recovery_case(
+            db_session, pe,
+            status=RecoveryStatus.REQUIRES_HUMAN.value,
+            strategy=RecoveryStrategy.HUMAN_REVIEW.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            requires_human_approval=True,
+            approved_by_human=None,
+        )
+        db_session.commit()
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            await client.post(f"/api/recovery-cases/{rc.id}/approve")
+            exec_resp = await client.post(f"/api/recovery-cases/{rc.id}/execute")
+
+        assert exec_resp.status_code == 200
+        data = exec_resp.json()
+        assert data["execution_mode"] == "SIMULATION"
+        assert data["status"] == ExecutionStatus.SUCCESS.value

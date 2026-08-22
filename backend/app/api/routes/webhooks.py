@@ -6,6 +6,7 @@ and persists payment.failed events with recovery case creation.
 
 import json
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -13,9 +14,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.enums import RecoveryStatus
+from app.models.recovery_case import RecoveryCase
 from app.schemas.webhook import RazorpayPaymentPayload, WebhookResponse
 from app.services.ingestion_service import ingest_payment_event
 from app.services.payment_normalizer import normalize_payment_failed
+from app.services.recovery_executor import execute_single_case
+from app.services.recovery_workflow import process_received_case
 from app.services.webhook_security import verify_razorpay_signature
 
 logger = logging.getLogger(__name__)
@@ -131,8 +136,29 @@ async def razorpay_webhook(
             detail="Internal error processing webhook",
         )
 
+    # 8. If new case created (not duplicate), run the recovery intelligence pipeline
+    if not result.duplicate and result.recovery_case_id:
+        process_received_case(db, result.recovery_case_id)
+
+        # Check if case transitioned to PENDING_EXECUTION and execution mode is SIMULATION
+        try:
+            rc_uuid = uuid.UUID(result.recovery_case_id)
+            rc = db.get(RecoveryCase, rc_uuid)
+            if (
+                rc is not None
+                and rc.status == RecoveryStatus.PENDING_EXECUTION.value
+                and settings.EXECUTION_MODE == "SIMULATION"
+            ):
+                execute_single_case(db, result.recovery_case_id)
+        except Exception as e:
+            logger.warning(
+                "Auto-execution check failed for case %s: %s",
+                result.recovery_case_id,
+                e,
+            )
+
     logger.info(
-        "Webhook ingested: event_id=%s duplicate=%s recovery_case_id=%s",
+        "Webhook ingested and processed: event_id=%s duplicate=%s recovery_case_id=%s",
         x_razorpay_event_id,
         result.duplicate,
         result.recovery_case_id,

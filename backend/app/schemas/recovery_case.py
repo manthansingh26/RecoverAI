@@ -128,6 +128,7 @@ class ReviewActionResponse(BaseModel):
     new_approved_by_human: bool | None
     action: str  # "approved" or "rejected"
     message: str
+    resolved_strategy: str | None = None
 
 
 # ---------------------------------------------------------------------------

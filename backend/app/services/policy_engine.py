@@ -40,12 +40,15 @@ def evaluate_policy(
     proposed_strategy: RecoveryStrategy,
     recovery_probability: float | None,
     retry_count: int,
+    human_approved: bool = False,
 ) -> PolicyDecision:
     """Evaluate a proposed strategy against deterministic policy rules.
 
     Rules enforced:
     1. HARD_FAILURE: Blocks WAIT_AND_RETRY, blocks auto CREATE_PAYMENT_LINK.
     2. UNKNOWN: Blocks WAIT_AND_RETRY and auto CREATE_PAYMENT_LINK.
+       When human_approved=True, this rule is relaxed — the human has
+       already reviewed the case and approved the strategy.
     3. MAX_RETRIES: Blocks WAIT_AND_RETRY when retry_count >= limit.
     4. HIGH_VALUE: Requires human approval for automated actions above threshold.
     5. STRATEGY_ALLOWLIST: Ensures strategy is a valid RecoveryStrategy.
@@ -56,6 +59,9 @@ def evaluate_policy(
         proposed_strategy: Strategy recommended by the advisor.
         recovery_probability: Model confidence in recovery (0-1), or None.
         retry_count: Number of retries already attempted.
+        human_approved: Whether a human has explicitly reviewed and approved
+            this case. When True, UNKNOWN rule 2 is relaxed since the
+            human review satisfies the safety requirement.
 
     Returns:
         PolicyDecision with approval status and applied rules.
@@ -104,8 +110,11 @@ def evaluate_policy(
             final_strategy = RecoveryStrategy.HUMAN_REVIEW
 
     # RULE 2 — UNKNOWN FAILURE
+    # When human_approved=True, this rule is relaxed: the human has already
+    # reviewed the case and explicitly approved the strategy, satisfying the
+    # safety requirement that UNKNOWN failures require human judgment.
     applied_rules.append("RULE_2_UNKNOWN_FAILURE")
-    if failure_category == FailureCategory.UNKNOWN:
+    if failure_category == FailureCategory.UNKNOWN and not human_approved:
         if proposed_strategy in (
             RecoveryStrategy.WAIT_AND_RETRY,
             RecoveryStrategy.CREATE_PAYMENT_LINK,

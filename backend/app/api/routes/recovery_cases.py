@@ -287,6 +287,7 @@ async def approve(
         new_approved_by_human=result.new_approved_by_human,
         action=result.action,
         message=result.message,
+        resolved_strategy=result.resolved_strategy,
     )
 
 

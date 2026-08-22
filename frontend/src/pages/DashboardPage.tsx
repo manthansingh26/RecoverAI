@@ -16,6 +16,7 @@ import {
   PieChart as PieChartIcon,
   CalendarDays,
   AlertCircle,
+  CreditCard,
 } from 'lucide-react';
 import {
   PieChart,
@@ -47,6 +48,7 @@ import SummaryCard from '../components/SummaryCard';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import SimulationModal from '../components/SimulationModal';
+import RazorpayCheckoutModal from '../components/RazorpayCheckoutModal';
 import LiveStatusIndicator from '../components/LiveStatusIndicator';
 import ActivityFeed from '../components/ActivityFeed';
 import { formatCurrency } from '../utils/format';
@@ -240,6 +242,7 @@ export default function DashboardPage() {
   } = usePolling(fetchAll, [], { intervalMs: 15000 });
 
   const [simulationOpen, setSimulationOpen] = useState(false);
+  const [razorpayTestOpen, setRazorpayTestOpen] = useState(false);
 
   const handleSimulationSuccess = useCallback(() => {
     refetch();
@@ -295,6 +298,14 @@ export default function DashboardPage() {
               intervalSec={15}
             />
             <button
+              onClick={() => setRazorpayTestOpen(true)}
+              className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-sm font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 active:scale-[0.98]"
+              title="Creates a Razorpay Test Mode payment to test the real payment.failed → webhook → recovery pipeline."
+            >
+              <CreditCard className="h-3.5 w-3.5" />
+              Test Real Razorpay Payment
+            </button>
+            <button
               onClick={() => setSimulationOpen(true)}
               className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
             >
@@ -322,6 +333,13 @@ export default function DashboardPage() {
                 </h3>
                 <p className="mt-2 max-w-md text-sm text-text-muted">
                   Use{' '}
+                  <button
+                    onClick={() => setRazorpayTestOpen(true)}
+                    className="font-semibold text-emerald-400 hover:underline"
+                  >
+                    Test Real Razorpay Payment
+                  </button>{' '}
+                  or{' '}
                   <button
                     onClick={() => setSimulationOpen(true)}
                     className="font-semibold text-accent-blue hover:underline"
@@ -781,6 +799,13 @@ export default function DashboardPage() {
       <SimulationModal
         isOpen={simulationOpen}
         onClose={() => setSimulationOpen(false)}
+        onSuccess={handleSimulationSuccess}
+      />
+
+      {/* Real Razorpay Test Checkout Modal */}
+      <RazorpayCheckoutModal
+        isOpen={razorpayTestOpen}
+        onClose={() => setRazorpayTestOpen(false)}
         onSuccess={handleSimulationSuccess}
       />
     </div>

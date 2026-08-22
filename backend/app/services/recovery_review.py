@@ -21,14 +21,20 @@ from typing import Any
 from sqlalchemy import case, cast, func, select, Date
 from sqlalchemy.orm import Session, joinedload
 
+import copy
+
 from app.models.enums import (
     ExecutionStatus,
+    FailureCategory,
     RecoveryStatus,
     RecoveryStrategy,
 )
 from app.models.execution_log import ExecutionLog
 from app.models.payment_event import PaymentEvent
 from app.models.recovery_case import RecoveryCase
+from app.services.failure_classifier import classify_failure
+from app.services.policy_engine import evaluate_policy
+from app.services.strategy_advisor import recommend_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +54,7 @@ class ReviewActionResult:
     new_approved_by_human: bool | None
     action: str
     message: str
+    resolved_strategy: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +155,133 @@ def get_execution_logs(
 
 
 # ---------------------------------------------------------------------------
+# Post-Approval Strategy Resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_post_approval_strategy(
+    db: Session,
+    rc: RecoveryCase,
+) -> str | None:
+    """Resolve a safe executable strategy after human approval.
+
+    Called when a HUMAN_REVIEW case is approved. Re-derives strategy using:
+    1. The existing failure category from the RecoveryCase (already set by
+       the decision engine during ingestion).
+    2. The strategy advisor to get a candidate strategy.
+    3. The policy engine to validate the candidate.
+    4. If the policy still forces HUMAN_REVIEW, falls back to
+       CREATE_PAYMENT_LINK (customer-initiated, lowest automation risk).
+
+    The audit trail records:
+    - original_strategy: what the decision engine originally recommended
+    - resolved_strategy: what was selected post-approval
+    - resolution_reason: why this strategy was chosen
+    - policy_validation: result of re-running the policy engine
+
+    Returns:
+        Strategy value string if resolution succeeded, None if the case
+        has no payment event or resolution is impossible.
+    """
+    payment_event = rc.payment_event
+    if payment_event is None:
+        logger.warning(
+            "Cannot resolve strategy: RecoveryCase %s has no PaymentEvent", rc.id
+        )
+        return None
+
+    # 1. Use existing classification from the RecoveryCase
+    try:
+        failure_category = FailureCategory(rc.failure_category)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Cannot resolve strategy: invalid failure_category '%s'",
+            rc.failure_category,
+        )
+        return None
+
+    # 2. Get strategy recommendation from the advisor
+    recommendation = recommend_strategy(
+        category=failure_category,
+        retry_count=rc.retry_count,
+        amount_paise=payment_event.amount_paise,
+    )
+
+    # 3. Validate through policy engine (human_approved=True since this
+    #    is a post-approval resolution — the human has already reviewed).
+    policy_decision = evaluate_policy(
+        amount_paise=payment_event.amount_paise,
+        failure_category=failure_category,
+        proposed_strategy=recommendation.strategy,
+        recovery_probability=recommendation.confidence,
+        retry_count=rc.retry_count,
+        human_approved=True,
+    )
+
+    candidate_strategy = policy_decision.final_strategy
+
+    # 4. If the resolved strategy is still HUMAN_REVIEW or STOP_RECOVERY,
+    #    fall back to CREATE_PAYMENT_LINK — it is customer-initiated and
+    #    carries the lowest automation risk.
+    if candidate_strategy in (
+        RecoveryStrategy.HUMAN_REVIEW,
+        RecoveryStrategy.STOP_RECOVERY,
+    ):
+        # Re-validate CREATE_PAYMENT_LINK through policy (human_approved=True)
+        fallback_policy = evaluate_policy(
+            amount_paise=payment_event.amount_paise,
+            failure_category=failure_category,
+            proposed_strategy=RecoveryStrategy.CREATE_PAYMENT_LINK,
+            recovery_probability=recommendation.confidence,
+            retry_count=rc.retry_count,
+            human_approved=True,
+        )
+        if fallback_policy.approved or fallback_policy.final_strategy == RecoveryStrategy.CREATE_PAYMENT_LINK.value:
+            candidate_strategy = RecoveryStrategy.CREATE_PAYMENT_LINK
+        else:
+            # Policy still blocks — cannot resolve
+            logger.warning(
+                "Policy blocks CREATE_PAYMENT_LINK for case %s: %s",
+                rc.id, fallback_policy.violations,
+            )
+            return None
+
+    # Only allow executable strategies through
+    if candidate_strategy not in (
+        RecoveryStrategy.WAIT_AND_RETRY,
+        RecoveryStrategy.CREATE_PAYMENT_LINK,
+    ):
+        logger.warning(
+            "Resolved strategy %s is not executable for case %s",
+            candidate_strategy.value, rc.id,
+        )
+        return None
+
+    # 5. Record resolution in the audit trail
+    trail = copy.deepcopy(rc.decision_audit_trail or {})
+    trail["approval_resolution"] = {
+        "original_strategy": rc.recommended_strategy,
+        "resolved_strategy": candidate_strategy.value,
+        "resolution_reason": (
+            f"Human approved HUMAN_REVIEW case. Strategy advisor recommended "
+            f"{recommendation.strategy.value} for {failure_category.value} "
+            f"category. Policy approved {candidate_strategy.value}."
+        ),
+        "policy_validation": {
+            "approved": policy_decision.approved,
+            "final_strategy": policy_decision.final_strategy.value,
+            "violations": policy_decision.violations,
+        },
+        "failure_category": failure_category.value,
+        "advisor_confidence": recommendation.confidence,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    rc.decision_audit_trail = trail
+
+    return candidate_strategy.value
+
+
+# ---------------------------------------------------------------------------
 # Approval
 # ---------------------------------------------------------------------------
 
@@ -212,24 +346,59 @@ def approve_case(
     # Perform approval
     rc.approved_by_human = True
 
-    # If case was in REQUIRES_HUMAN and has a valid strategy, transition
-    # to PENDING_EXECUTION so it can be executed
+    # Record original strategy before any resolution
+    original_strategy = rc.recommended_strategy
+    resolved_strategy: str | None = None
+
     if rc.status == RecoveryStatus.REQUIRES_HUMAN.value:
-        # Only transition if there's a valid executable strategy
-        if rc.recommended_strategy in (
+        if rc.recommended_strategy == RecoveryStrategy.HUMAN_REVIEW.value:
+            # --- Post-approval strategy resolution ---
+            # The case has HUMAN_REVIEW as its strategy. Resolve to a safe
+            # executable strategy by re-running the strategy advisor on the
+            # existing failure category, then validating through the policy
+            # engine.
+            resolved_strategy = _resolve_post_approval_strategy(
+                db=db,
+                rc=rc,
+            )
+
+            if resolved_strategy is not None:
+                rc.recommended_strategy = resolved_strategy
+                # Derive status from the resolved strategy
+                rc.status = RecoveryStatus.PENDING_EXECUTION.value
+                rc.next_run_at = datetime.now(timezone.utc)
+            else:
+                # Resolution failed — keep HUMAN_REVIEW, no transition
+                logger.warning(
+                    "Strategy resolution failed for case %s; "
+                    "keeping HUMAN_REVIEW strategy",
+                    recovery_case_id,
+                )
+
+        elif rc.recommended_strategy in (
             RecoveryStrategy.WAIT_AND_RETRY.value,
             RecoveryStrategy.CREATE_PAYMENT_LINK.value,
         ):
+            # Already has an executable strategy — transition directly
             rc.status = RecoveryStatus.PENDING_EXECUTION.value
-            # Set next_run_at to now so it becomes immediately due
             rc.next_run_at = datetime.now(timezone.utc)
 
     db.commit()
     db.refresh(rc)
 
+    # Build resolution message
+    if resolved_strategy is not None:
+        message = (
+            f"Case approved: {previous_status} -> {rc.status}. "
+            f"Strategy resolved from {original_strategy} to {resolved_strategy}."
+        )
+    else:
+        message = f"Case approved: {previous_status} -> {rc.status}"
+
     logger.info(
-        "Case %s approved: %s -> %s",
+        "Case %s approved: %s -> %s (original_strategy=%s resolved=%s)",
         recovery_case_id, previous_status, rc.status,
+        original_strategy, resolved_strategy,
     )
 
     return ReviewActionResult(
@@ -239,7 +408,8 @@ def approve_case(
         previous_approved_by_human=previous_approved,
         new_approved_by_human=rc.approved_by_human,
         action="approved",
-        message=f"Case approved: {previous_status} -> {rc.status}",
+        message=message,
+        resolved_strategy=resolved_strategy,
     )
 
 
