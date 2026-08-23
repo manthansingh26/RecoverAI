@@ -5,7 +5,9 @@ import type {
   ExecutionLogsResponse,
   ReviewActionResponse,
   ExecutionResponse,
+  RecoveryCheckoutResponse,
 } from '../types';
+
 
 export interface ListCasesParams {
   status?: string;
@@ -77,5 +79,13 @@ export function executeCase(
 ): Promise<ExecutionResponse> {
   return api.post<ExecutionResponse>(
     `/api/recovery-cases/${recoveryCaseId}/execute`,
+  );
+}
+
+export function createRecoveryCheckout(
+  recoveryCaseId: string,
+): Promise<RecoveryCheckoutResponse> {
+  return api.post<RecoveryCheckoutResponse>(
+    `/api/recovery-cases/${recoveryCaseId}/recovery-checkout`,
   );
 }

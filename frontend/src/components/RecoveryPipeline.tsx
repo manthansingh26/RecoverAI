@@ -219,9 +219,10 @@ function derivePipelineStages(caseData: RecoveryCaseDetail): PipelineStage[] {
 
   if (isSuccess) {
     stage7State = 'completed';
-    stage7Description = 'Recovery successful (simulated)';
+    stage7Description = 'Payment Recovered (Verified)';
     stage7Icon = CheckCircle2;
   } else if (isFailed) {
+
     stage7State = 'failed';
     stage7Description = approved === false
       ? 'Recovery stopped — rejected by human'

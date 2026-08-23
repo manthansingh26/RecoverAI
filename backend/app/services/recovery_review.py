@@ -784,8 +784,14 @@ def get_dashboard_activity(db: Session, limit: int = 20) -> dict[str, Any]:
         pe = rc.payment_event if rc else None
         action_label = (log.action or "").replace("_", " ").title()
         occurred_at = log.executed_at or log.created_at
+        success_payment_id = log.response_data.get("payment_id") or (pe.external_payment_id if pe else None)
 
-        if log.status == ExecutionStatus.SUCCESS.value:
+        if log.action == "PAYMENT_RECOVERED" and log.status == ExecutionStatus.SUCCESS.value:
+            activity_type = "PAYMENT_RECOVERED"
+            title = "Payment Recovered"
+            amt_str = f" of ₹{pe.amount_paise / 100:,.2f}" if pe and pe.amount_paise else ""
+            desc = f"Payment{amt_str} verified via Razorpay Test Mode (payment.captured)"
+        elif log.status == ExecutionStatus.SUCCESS.value:
             activity_type = "EXECUTION_SUCCESS"
             title = "Recovery Execution Succeeded"
             desc = f"Strategy '{action_label}' executed successfully in simulation"
@@ -810,11 +816,12 @@ def get_dashboard_activity(db: Session, limit: int = 20) -> dict[str, Any]:
             "description": desc,
             "occurred_at": occurred_at,
             "recovery_case_id": str(rc.id) if rc else None,
-            "payment_id": pe.external_payment_id if pe else None,
+            "payment_id": success_payment_id,
             "status": rc.status if rc else None,
             "strategy": log.action,
             "amount_paise": pe.amount_paise if pe else None,
         })
+
 
     # 2. Fetch recent recovery cases with joined payment event
     cases = (

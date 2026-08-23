@@ -280,3 +280,19 @@ class ActivityFeed(BaseModel):
 
     items: list[ActivityItem] = []
     generated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Recovery Checkout (Milestone 12)
+# ---------------------------------------------------------------------------
+
+class RecoveryCheckoutResponse(BaseModel):
+    """Response model for recovery checkout order generation."""
+
+    key_id: str
+    order_id: str
+    amount: int
+    currency: str
+    receipt: str
+    recovery_case_id: str
+    is_reused: bool = False

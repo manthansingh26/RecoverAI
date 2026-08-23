@@ -14,10 +14,20 @@ import {
   Zap,
   RotateCcw,
   FileText,
+  CreditCard,
+  Loader2,
 } from 'lucide-react';
-import { getRecoveryCase, approveCase, rejectCase, executeCase } from '../api/recoveryCases';
+import {
+  getRecoveryCase,
+  approveCase,
+  rejectCase,
+  executeCase,
+  createRecoveryCheckout,
+} from '../api/recoveryCases';
+import { loadRazorpayScript } from '../utils/loadRazorpay';
 import { usePolling } from '../hooks/usePolling';
 import StatusBadge from '../components/StatusBadge';
+
 import LoadingSpinner from '../components/LoadingSpinner';
 import ErrorMessage from '../components/ErrorMessage';
 import Modal from '../components/Modal';
@@ -63,8 +73,72 @@ export default function RecoveryCaseDetailPage() {
   const [rejectModalOpen, setRejectModalOpen] = useState(false);
   const [executeModalOpen, setExecuteModalOpen] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [actionResult, setActionResult] = useState<string | null>(null);
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
+
+  const handleLaunchRecoveryCheckout = async () => {
+    if (!id || !caseData) return;
+    setCheckoutLoading(true);
+    setActionResult(null);
+
+    try {
+      const scriptLoaded = await loadRazorpayScript();
+      if (!scriptLoaded || !window.Razorpay) {
+        throw new Error('Failed to load Razorpay Checkout SDK. Please check your internet connection.');
+      }
+
+      // 1. Request recovery checkout order from backend
+      const res = await createRecoveryCheckout(id);
+
+      // 2. Launch Razorpay Checkout Modal
+      const options = {
+        key: res.key_id,
+        amount: res.amount,
+        currency: res.currency,
+        name: 'RecoverAI',
+        description: `Recovery Payment (Case ${id.slice(0, 8)}...)`,
+        order_id: res.order_id,
+        prefill: {
+          name: 'Demo Customer',
+          email: 'customer@recoverai.local',
+          contact: '9999999999',
+        },
+        notes: {
+          recovery_case_id: res.recovery_case_id,
+        },
+        theme: {
+          color: '#10b981',
+        },
+        modal: {
+          ondismiss: () => {
+            setCheckoutLoading(false);
+            refetch();
+          },
+        },
+        handler: () => {
+          setCheckoutLoading(false);
+          setActionResult(
+            '✓ Test payment submitted. Awaiting backend webhook confirmation (payment.captured)...',
+          );
+          refetch();
+        },
+      };
+
+      const rzp = new window.Razorpay(options);
+      rzp.on('payment.failed', () => {
+        setCheckoutLoading(false);
+        setActionResult('⚠ Payment failed in Razorpay Test modal.');
+        refetch();
+      });
+      rzp.open();
+    } catch (err) {
+      setCheckoutLoading(false);
+      setActionResult(
+        `Error: ${err instanceof Error ? err.message : 'Failed to launch checkout'}`,
+      );
+    }
+  };
 
   const handleApprove = async () => {
     setActionLoading(true);
@@ -73,6 +147,7 @@ export default function RecoveryCaseDetailPage() {
       const res = await approveCase(id!);
       setActionResult(`✓ ${res.message}`);
       setApproveModalOpen(false);
+
       refetch();
     } catch (err) {
       setActionResult(
@@ -206,6 +281,77 @@ export default function RecoveryCaseDetailPage() {
 
       {/* Recovery Pipeline Visualization */}
       <RecoveryPipeline caseData={caseData} />
+
+      {/* Resolved Success Verified Banner */}
+      {caseData.status === 'RESOLVED_SUCCESS' && (
+        <div className="mb-6 rounded-xl border-2 border-emerald-500/30 bg-emerald-500/10 p-6">
+          <div className="flex items-start gap-4">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-400">
+              <CheckCircle2 className="h-6 w-6" />
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg font-bold text-emerald-400">
+                  Payment Recovered — Verified
+                </h2>
+                <span className="rounded-full bg-emerald-500/20 border border-emerald-500/40 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                  Razorpay Test Mode Verified
+                </span>
+              </div>
+              <p className="mt-1 text-xs text-emerald-200/90 leading-relaxed">
+                This payment failure has been successfully recovered via verified Razorpay Test Mode settlement. Future recovery execution has been disarmed.
+              </p>
+              {typeof caseData.decision_audit_trail?.recovery_completion === 'object' && caseData.decision_audit_trail?.recovery_completion !== null && (
+                <div className="mt-3 flex flex-wrap items-center gap-4 rounded-lg bg-black/20 border border-emerald-500/20 px-3 py-2 text-xs font-mono text-emerald-300">
+                  <span>Payment ID: <strong className="text-white">{String((caseData.decision_audit_trail.recovery_completion as Record<string, unknown>).payment_id || '—')}</strong></span>
+                  <span>• Order ID: <strong className="text-white">{String((caseData.decision_audit_trail.recovery_completion as Record<string, unknown>).order_id || '—')}</strong></span>
+                  <span>• Amount: <strong className="text-white">{formatCurrency(Number((caseData.decision_audit_trail.recovery_completion as Record<string, unknown>).amount_paise || caseData.payment_event?.amount_paise || 0))}</strong></span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Recovery Payment Checkout Action */}
+      {caseData.status === 'PENDING_EXECUTION' && (
+        <div className="mb-6 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-5">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-semibold text-emerald-400 flex items-center gap-2">
+                  <CreditCard className="h-4 w-4" />
+                  Customer Recovery Payment
+                </h3>
+                <span className="rounded-full bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-semibold text-emerald-400">
+                  Test Mode
+                </span>
+              </div>
+              <p className="text-xs text-text-muted mt-1">
+                Simulate customer completing the recovery checkout via Razorpay Checkout Modal.
+              </p>
+            </div>
+            <button
+              onClick={handleLaunchRecoveryCheckout}
+              disabled={checkoutLoading}
+              className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-all hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-50"
+            >
+              {checkoutLoading ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>Preparing Checkout...</span>
+                </>
+              ) : (
+                <>
+                  <CreditCard className="h-3.5 w-3.5" />
+                  <span>Complete Recovery Checkout (Test Mode)</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
 
       {/* Action result message */}
       {actionResult && (

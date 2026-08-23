@@ -28,6 +28,13 @@ function getActivityConfig(type: string): {
   borderColor: string;
 } {
   switch (type) {
+    case 'PAYMENT_RECOVERED':
+      return {
+        icon: CheckCircle2,
+        iconColor: 'text-emerald-400',
+        bgColor: 'bg-emerald-500/15',
+        borderColor: 'border-emerald-500/30',
+      };
     case 'EXECUTION_SUCCESS':
       return {
         icon: CheckCircle2,
@@ -35,6 +42,7 @@ function getActivityConfig(type: string): {
         bgColor: 'bg-green-500/10',
         borderColor: 'border-green-500/20',
       };
+
     case 'EXECUTION_FAILED':
       return {
         icon: XCircle,

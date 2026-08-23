@@ -1,7 +1,8 @@
 """Razorpay webhook ingestion endpoint.
 
 Receives raw webhook requests, verifies HMAC-SHA256 signature,
-and persists payment.failed events with recovery case creation.
+persists payment.failed events with recovery case creation,
+and resolves recovery cases on verified payment.captured events.
 """
 
 import json
@@ -16,10 +17,14 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.enums import RecoveryStatus
 from app.models.recovery_case import RecoveryCase
-from app.schemas.webhook import RazorpayPaymentPayload, WebhookResponse
+from app.schemas.webhook import WebhookResponse
 from app.services.ingestion_service import ingest_payment_event
-from app.services.payment_normalizer import normalize_payment_failed
+from app.services.payment_normalizer import (
+    normalize_payment_captured,
+    normalize_payment_failed,
+)
 from app.services.recovery_executor import execute_single_case
+from app.services.recovery_resolver import resolve_recovery_by_payment
 from app.services.recovery_workflow import process_received_case
 from app.services.webhook_security import verify_razorpay_signature
 
@@ -41,8 +46,9 @@ async def razorpay_webhook(
     1. Read raw body bytes (no parsing before verification).
     2. Verify HMAC-SHA256 signature.
     3. Parse JSON only after successful verification.
-    4. Process payment.failed events only; acknowledge others.
-    5. Persist with idempotency via external_event_id uniqueness.
+    4. Process payment.failed (ingest & start recovery pipeline).
+    5. Process payment.captured (canonical recovery resolution).
+    6. Acknowledge order.paid and other events safely without state change.
 
     Args:
         request: The raw FastAPI request object.
@@ -93,8 +99,40 @@ async def razorpay_webhook(
             detail="Invalid JSON in request body",
         )
 
-    # 5. Check event type — only process payment.failed for this milestone
     event_type = body_json.get("event", "")
+
+    # 5. Canonical Recovery Resolution: payment.captured
+    if event_type == "payment.captured":
+        try:
+            normalized_captured = normalize_payment_captured(
+                event_id=x_razorpay_event_id,
+                payload_data=body_json,
+                raw_payload=body_json,
+            )
+        except ValueError as e:
+            logger.warning("payment.captured normalization failed: %s", e)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid payment.captured payload: {e}",
+            )
+
+        return resolve_recovery_by_payment(db=db, normalized=normalized_captured)
+
+    # 6. Order Paid: acknowledged safely without independent financial state transition
+    if event_type == "order.paid":
+        logger.info(
+            "Acknowledging order.paid event %s (canonical recovery resolution handled via payment.captured)",
+            x_razorpay_event_id,
+        )
+        return WebhookResponse(
+            accepted=True,
+            duplicate=False,
+            event_id=x_razorpay_event_id,
+            recovery_case_id=None,
+            message="Event type 'order.paid' acknowledged (canonical resolution handled by payment.captured)",
+        )
+
+    # 7. Non-failure / other events: acknowledged safely
     if event_type != "payment.failed":
         logger.info(
             "Ignoring event type '%s' (event_id=%s)", event_type, x_razorpay_event_id
@@ -107,7 +145,7 @@ async def razorpay_webhook(
             message=f"Event type '{event_type}' accepted but not processed by this milestone",
         )
 
-    # 6. Normalize the payment.failed payload
+    # 8. Normalize the payment.failed payload
     try:
         normalized = normalize_payment_failed(
             event_id=x_razorpay_event_id,
@@ -121,7 +159,7 @@ async def razorpay_webhook(
             detail=f"Invalid payment.failed payload: {e}",
         )
 
-    # 7. Persist with idempotency
+    # 9. Persist with idempotency
     result = ingest_payment_event(
         db=db,
         normalized=normalized,
@@ -136,7 +174,7 @@ async def razorpay_webhook(
             detail="Internal error processing webhook",
         )
 
-    # 8. If new case created (not duplicate), run the recovery intelligence pipeline
+    # 10. If new case created (not duplicate), run the recovery intelligence pipeline
     if not result.duplicate and result.recovery_case_id:
         process_received_case(db, result.recovery_case_id)
 

@@ -289,7 +289,18 @@ export interface RazorpayPaymentErrorResponse {
   };
 }
 
+export interface RecoveryCheckoutResponse {
+  key_id: string;
+  order_id: string;
+  amount: number;
+  currency: string;
+  receipt: string;
+  recovery_case_id: string;
+  is_reused?: boolean;
+}
+
 export interface RazorpayCheckoutOptions {
+
   key: string;
   amount: number;
   currency: string;

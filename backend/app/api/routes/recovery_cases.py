@@ -13,11 +13,15 @@ import logging
 import math
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.enums import RecoveryStatus
+from app.models.recovery_case import RecoveryCase
 from app.schemas.recovery_case import (
     ExecutionLogSummary,
     ExecutionLogsResponse,
@@ -27,8 +31,10 @@ from app.schemas.recovery_case import (
     RecoveryCaseDetail,
     RecoveryCaseListItem,
     RecoveryCaseListResponse,
+    RecoveryCheckoutResponse,
     ReviewActionResponse,
 )
+from app.services.payment_service import create_razorpay_order_internal
 from app.services.recovery_executor import execute_single_case
 from app.services.recovery_review import (
     approve_case,
@@ -42,6 +48,7 @@ from app.services.recovery_review import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
 
 
 # ---------------------------------------------------------------------------
@@ -364,4 +371,125 @@ async def manual_execute(
         previous_case_status=result.previous_case_status,
         new_case_status=result.new_case_status,
         message=result.message,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/recovery-cases/{recovery_case_id}/recovery-checkout (Milestone 12)
+# ---------------------------------------------------------------------------
+
+@router.post(
+    "/api/recovery-cases/{recovery_case_id}/recovery-checkout",
+    response_model=RecoveryCheckoutResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Create or reuse a Razorpay Test recovery order for this case",
+)
+def create_or_reuse_recovery_checkout(
+    recovery_case_id: str,
+    db: Session = Depends(get_db),
+) -> RecoveryCheckoutResponse:
+    """Create or reuse a Razorpay Test Mode recovery order for customer checkout.
+
+    Required behavior:
+    1. Validates UUID and case existence.
+    2. Rejects cases already in RESOLVED_SUCCESS.
+    3. Rejects cases in RESOLVED_FAILED.
+    4. If case already has an active recovery_order in decision_audit_trail,
+       reuses and returns the existing order details (prevents duplicate orders).
+    5. If no active order exists, creates a fresh Razorpay Test order with
+       notes.recovery_case_id and notes.original_order_id.
+    6. Persists recovery-order metadata inside decision_audit_trail["recovery_order"].
+    7. Never returns RAZORPAY_KEY_SECRET.
+    """
+    case_uuid = _validate_uuid(recovery_case_id)
+
+    rc = db.get(RecoveryCase, case_uuid)
+    if rc is None:
+        raise HTTPException(status_code=404, detail="Recovery case not found")
+
+    if rc.status == RecoveryStatus.RESOLVED_SUCCESS.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Recovery case is already successfully resolved.",
+        )
+
+    if rc.status == RecoveryStatus.RESOLVED_FAILED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Recovery case is marked as failed. Cannot open new recovery checkout.",
+        )
+
+    pe = rc.payment_event
+    if pe is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Recovery case has no associated payment event data",
+        )
+
+    # Check if an active recovery_order already exists in decision_audit_trail
+    trail = dict(rc.decision_audit_trail or {})
+    existing_rec_order = trail.get("recovery_order")
+
+    if (
+        isinstance(existing_rec_order, dict)
+        and existing_rec_order.get("order_id")
+        and settings.RAZORPAY_KEY_ID
+    ):
+        logger.info(
+            "Reusing existing active recovery order %s for case %s",
+            existing_rec_order["order_id"],
+            rc.id,
+        )
+        return RecoveryCheckoutResponse(
+            key_id=settings.RAZORPAY_KEY_ID,
+            order_id=existing_rec_order["order_id"],
+            amount=existing_rec_order.get("amount_paise", pe.amount_paise),
+            currency=existing_rec_order.get("currency", pe.currency),
+            receipt=existing_rec_order.get("receipt", f"rcpt_rec_{str(rc.id)[:12]}"),
+            recovery_case_id=str(rc.id),
+            is_reused=True,
+        )
+
+    # Create a new Razorpay Test Order with attached metadata notes
+    receipt = f"rcpt_rec_{str(rc.id)[:12]}"
+    notes = {
+        "recovery_case_id": str(rc.id),
+        "original_order_id": pe.external_order_id or "",
+        "recovery_attempt": str(rc.retry_count),
+    }
+
+    result = create_razorpay_order_internal(
+        amount_paise=pe.amount_paise,
+        currency=pe.currency,
+        receipt=receipt,
+        notes=notes,
+    )
+
+    # Persist recovery order metadata in decision_audit_trail
+    trail["recovery_order"] = {
+        "order_id": result.order_id,
+        "amount_paise": result.amount_paise,
+        "currency": result.currency,
+        "receipt": result.receipt,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "created",
+    }
+    rc.decision_audit_trail = trail
+    db.commit()
+
+    logger.info(
+        "Created new recovery order %s for case %s (amount=%d paise)",
+        result.order_id,
+        rc.id,
+        result.amount_paise,
+    )
+
+    return RecoveryCheckoutResponse(
+        key_id=result.key_id,
+        order_id=result.order_id,
+        amount=result.amount_paise,
+        currency=result.currency,
+        receipt=result.receipt,
+        recovery_case_id=str(rc.id),
+        is_reused=False,
     )

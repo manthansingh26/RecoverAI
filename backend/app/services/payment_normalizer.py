@@ -1,13 +1,14 @@
 """Normalize Razorpay webhook payloads into PaymentEvent-compatible data."""
 
 import hashlib
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from typing import Any
 
 
 @dataclass
 class NormalizedPaymentEvent:
-    """Normalized data ready for PaymentEvent persistence."""
+    """Normalized data ready for PaymentEvent persistence and recovery resolution."""
 
     event_type: str
     external_event_id: str
@@ -20,11 +21,30 @@ class NormalizedPaymentEvent:
     error_description: str | None
     raw_payload: dict[str, Any]
     payload_hash: str
+    status: str | None = None
+    notes: dict[str, Any] = field(default_factory=dict)
 
 
 def compute_payload_hash(raw_body: bytes) -> str:
     """Compute SHA-256 hash of the raw request body for audit/dedup."""
     return hashlib.sha256(raw_body).hexdigest()
+
+
+def _extract_payment_entity(payload_data: dict[str, Any]) -> dict[str, Any]:
+    """Helper to extract payment dictionary from standard or simulated webhook shape."""
+    payload_section = payload_data.get("payload", {})
+    if not isinstance(payload_section, dict):
+        raise ValueError("Missing or invalid 'payload' in event data")
+
+    payment_wrapper = payload_section.get("payment", {})
+    if not isinstance(payment_wrapper, dict):
+        raise ValueError("Missing or invalid 'payload.payment' object")
+
+    # Real Razorpay shape: payload.payment.entity contains the actual fields
+    if "entity" in payment_wrapper and isinstance(payment_wrapper["entity"], dict):
+        return payment_wrapper["entity"]
+    # Simulation / existing test shape: fields directly on payload.payment
+    return payment_wrapper
 
 
 def normalize_payment_failed(
@@ -49,31 +69,8 @@ def normalize_payment_failed(
     if not event_type:
         raise ValueError("Missing 'event' field in payload")
 
-    # Extract payment object from payload.
-    # Real Razorpay webhooks nest the payment data under:
-    #   payload.payment.entity
-    # while the existing simulation format uses:
-    #   payload.payment
-    # (fields like amount, id, etc. directly on payload.payment)
-    #
-    # We prefer the real Razorpay structure when the "entity" key exists
-    # and is a dict (matching Razorpay's published webhook schema).
-    payload_section = payload_data.get("payload", {})
-    if not isinstance(payload_section, dict):
-        raise ValueError("Missing or invalid 'payload' in event data")
+    payment_obj = _extract_payment_entity(payload_data)
 
-    payment_wrapper = payload_section.get("payment", {})
-    if not isinstance(payment_wrapper, dict):
-        raise ValueError("Missing or invalid 'payload.payment' object")
-
-    # Real Razorpay shape: payload.payment.entity contains the actual fields
-    if "entity" in payment_wrapper and isinstance(payment_wrapper["entity"], dict):
-        payment_obj = payment_wrapper["entity"]
-    else:
-        # Simulation / existing test shape: fields directly on payload.payment
-        payment_obj = payment_wrapper
-
-    # amount_paise: Razorpay amount is in paise (smallest currency unit)
     amount = payment_obj.get("amount")
     if amount is None or not isinstance(amount, int) or amount <= 0:
         raise ValueError(f"Invalid or missing payment amount: {amount}")
@@ -81,9 +78,9 @@ def normalize_payment_failed(
     error_code = payment_obj.get("error_code")
     error_reason = payment_obj.get("error_reason")
     error_description = payment_obj.get("error_description")
+    notes = payment_obj.get("notes") if isinstance(payment_obj.get("notes"), dict) else {}
 
-    # Compute payload hash from the stored raw payload
-    raw_json = __import__("json").dumps(raw_payload, sort_keys=True).encode()
+    raw_json = json.dumps(raw_payload, sort_keys=True).encode()
     payload_hash = hashlib.sha256(raw_json).hexdigest()
 
     return NormalizedPaymentEvent(
@@ -98,4 +95,57 @@ def normalize_payment_failed(
         error_description=error_description,
         raw_payload=raw_payload,
         payload_hash=payload_hash,
+        status=payment_obj.get("status"),
+        notes=notes,
+    )
+
+
+def normalize_payment_captured(
+    event_id: str,
+    payload_data: dict[str, Any],
+    raw_payload: dict[str, Any],
+) -> NormalizedPaymentEvent:
+    """Normalize a Razorpay payment.captured event.
+
+    Args:
+        event_id: The x-razorpay-event-id header value.
+        payload_data: The parsed JSON event payload.
+        raw_payload: The full raw JSON body for storage.
+
+    Returns:
+        NormalizedPaymentEvent ready for recovery resolution.
+
+    Raises:
+        ValueError: If essential fields or payment amount are missing.
+    """
+    event_type = payload_data.get("event", "")
+    if not event_type:
+        raise ValueError("Missing 'event' field in payload")
+
+    payment_obj = _extract_payment_entity(payload_data)
+
+    amount = payment_obj.get("amount")
+    if amount is None or not isinstance(amount, int) or amount <= 0:
+        raise ValueError(f"Invalid or missing payment amount: {amount}")
+
+    status = payment_obj.get("status")
+    notes = payment_obj.get("notes") if isinstance(payment_obj.get("notes"), dict) else {}
+
+    raw_json = json.dumps(raw_payload, sort_keys=True).encode()
+    payload_hash = hashlib.sha256(raw_json).hexdigest()
+
+    return NormalizedPaymentEvent(
+        event_type=event_type,
+        external_event_id=event_id,
+        external_payment_id=payment_obj.get("id"),
+        external_order_id=payment_obj.get("order_id"),
+        amount_paise=amount,
+        currency=payment_obj.get("currency", "INR"),
+        error_code=None,
+        error_reason=None,
+        error_description=None,
+        raw_payload=raw_payload,
+        payload_hash=payload_hash,
+        status=status,
+        notes=notes,
     )
