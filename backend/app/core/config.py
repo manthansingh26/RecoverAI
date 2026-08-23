@@ -1,5 +1,6 @@
 """Application configuration using Pydantic Settings."""
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -23,6 +24,24 @@ class Settings(BaseSettings):
     EXECUTION_MODE: str = "SIMULATION"
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
+
+    # Milestone 11: Automatic Recovery Scheduler settings
+    # SCHEDULER_ENABLED defaults to False — must be explicitly enabled.
+    # Reason: if EXECUTION_MODE is ever changed to RAZORPAY, an implicitly
+    # enabled scheduler could trigger real financial actions without operator
+    # intent. Explicit opt-in is required.
+    SCHEDULER_ENABLED: bool = False
+    # Must be >= 1 to prevent a busy loop.
+    SCHEDULER_INTERVAL_SECONDS: int = 30
+
+    @field_validator("SCHEDULER_INTERVAL_SECONDS")
+    @classmethod
+    def _validate_interval(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(
+                f"SCHEDULER_INTERVAL_SECONDS must be >= 1, got {v}"
+            )
+        return v
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

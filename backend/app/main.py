@@ -1,5 +1,8 @@
 """RecoverAI backend — FastAPI application entry point."""
 
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -11,6 +14,7 @@ from app.api.routes.simulation import router as simulation_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflow import router as workflow_router
 from app.core.config import settings
+from app.services.recovery_scheduler import RecoveryScheduler
 
 
 def _get_cors_origins() -> list[str]:
@@ -26,12 +30,46 @@ def _get_cors_origins() -> list[str]:
     return []
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """FastAPI lifespan — manages background tasks across the application lifetime.
+
+    Starts the recovery scheduler on application startup (when enabled) and
+    ensures it is gracefully stopped before the process exits.
+
+    The scheduler is an explicit opt-in (SCHEDULER_ENABLED=False by default)
+    to prevent unintentional execution if EXECUTION_MODE is ever changed to
+    RAZORPAY in a future deployment.
+
+    Shutdown sequence:
+    1. Signal shutdown_event so the loop won't start a new cycle.
+    2. Cancel the asyncio task (wakes up any sleeping wait_for).
+    3. Await the task so the event loop is clean before lifespan exits.
+    The currently-running cycle is allowed to finish because each cycle
+    commits per-case and execute_due_cases() is cooperative.
+    """
+    scheduler: RecoveryScheduler | None = None
+
+    if settings.SCHEDULER_ENABLED:
+        scheduler = RecoveryScheduler(
+            interval_seconds=settings.SCHEDULER_INTERVAL_SECONDS
+        )
+        await scheduler.start()
+
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            await scheduler.stop()
+
+
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="RecoverAI",
         description="Event-driven payment recovery system",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
     # CORS — only enabled when allowed origins are configured
