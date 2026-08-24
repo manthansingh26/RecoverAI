@@ -462,7 +462,7 @@ export default function DashboardPage() {
               <div className="mb-8">
                 <ActivityFeed
                   items={activityItems}
-                  onSimulateClick={() => setSimulationOpen(true)}
+                  onSimulateClick={canOperate ? () => setSimulationOpen(true) : undefined}
                 />
               </div>
 

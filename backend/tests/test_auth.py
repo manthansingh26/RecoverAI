@@ -864,3 +864,140 @@ class TestRouteCoverage:
         for path in ("/", "/health"):
             route = next(r for r in app.routes if getattr(r, "path", "") == path)
             assert not self._route_has_auth(route)
+
+
+# ---------------------------------------------------------------------------
+# End-to-End Authentication Lifecycle & Role Boundary Tests (Milestone 14B)
+# ---------------------------------------------------------------------------
+
+class TestEndToEndLifecycleAndRBAC:
+    @pytest.mark.asyncio
+    async def test_full_e2e_login_me_dashboard_logout_cycle(self, db_session) -> None:
+        """Verify the complete user journey: unauth -> login -> restore -> access -> logout -> unauth."""
+        _disable_auth_override()
+        _create_operator(
+            db_session,
+            email="e2e-operator@recoverai.local",
+            password="secure-password-123",
+            role=OperatorRole.OPERATOR.value,
+        )
+
+        async with await _client() as c:
+            # 1. Unauthenticated request to protected route must fail with 401
+            unauth_resp = await c.get("/api/dashboard/summary")
+            assert unauth_resp.status_code == 401
+
+            # 2. Login with valid credentials succeeds and issues __Host- cookie
+            login_resp = await c.post(
+                "/api/auth/login",
+                json={
+                    "email": "e2e-operator@recoverai.local",
+                    "password": "secure-password-123",
+                },
+            )
+            assert login_resp.status_code == 200
+            user_data = login_resp.json()
+            assert user_data["email"] == "e2e-operator@recoverai.local"
+            assert user_data["role"] == OperatorRole.OPERATOR.value
+            session_token = _cookie_value(login_resp)
+            assert session_token is not None
+
+            # 3. Session restore on refresh (/api/auth/me) returns identity
+            me_resp = await c.get(
+                "/api/auth/me",
+                cookies={SESSION_COOKIE_NAME: session_token},
+            )
+            assert me_resp.status_code == 200
+            assert me_resp.json()["email"] == "e2e-operator@recoverai.local"
+
+            # 4. Access protected dashboard endpoints
+            dash_resp = await c.get(
+                "/api/dashboard/summary",
+                cookies={SESSION_COOKIE_NAME: session_token},
+            )
+            assert dash_resp.status_code == 200
+
+            # 5. Logout deletes session server-side
+            logout_resp = await c.post(
+                "/api/auth/logout",
+                cookies={SESSION_COOKIE_NAME: session_token},
+            )
+            assert logout_resp.status_code == 200
+
+            # 6. Subsequent requests with old session cookie must now fail with 401
+            post_logout_me = await c.get(
+                "/api/auth/me",
+                cookies={SESSION_COOKIE_NAME: session_token},
+            )
+            assert post_logout_me.status_code == 401
+
+            post_logout_dash = await c.get(
+                "/api/dashboard/summary",
+                cookies={SESSION_COOKIE_NAME: session_token},
+            )
+            assert post_logout_dash.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_e2e_viewer_vs_operator_action_boundaries(self, db_session) -> None:
+        """Verify strict authorization enforcement between VIEWER and OPERATOR roles across all endpoints."""
+        _disable_auth_override()
+        _create_operator(
+            db_session,
+            email="viewer-e2e@recoverai.local",
+            password="viewer-pass-123",
+            role=OperatorRole.VIEWER.value,
+        )
+        _create_operator(
+            db_session,
+            email="operator-e2e@recoverai.local",
+            password="operator-pass-123",
+            role=OperatorRole.OPERATOR.value,
+        )
+
+        async with await _client() as c:
+            # Login as VIEWER
+            viewer_login = await c.post(
+                "/api/auth/login",
+                json={"email": "viewer-e2e@recoverai.local", "password": "viewer-pass-123"},
+            )
+            assert viewer_login.status_code == 200
+            viewer_token = _cookie_value(viewer_login)
+
+            # VIEWER can read
+            viewer_dash = await c.get("/api/dashboard/summary", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_dash.status_code == 200
+            viewer_cases = await c.get("/api/recovery-cases", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_cases.status_code == 200
+
+            # VIEWER is forbidden from write/mutation actions (403)
+            random_id = str(uuid.uuid4())
+            viewer_approve = await c.post(f"/api/recovery-cases/{random_id}/approve", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_approve.status_code == 403
+            viewer_reject = await c.post(f"/api/recovery-cases/{random_id}/reject", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_reject.status_code == 403
+            viewer_exec = await c.post(f"/api/recovery-cases/{random_id}/execute", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_exec.status_code == 403
+            viewer_checkout = await c.post(f"/api/recovery-cases/{random_id}/recovery-checkout", cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_checkout.status_code == 403
+            viewer_order = await c.post("/api/payments/create-order", json={"amount": 500}, cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_order.status_code == 403
+            viewer_sim = await c.post("/api/dev/simulate-payment-failure", json={"scenario": "LOW_VALUE_TRANSIENT"}, cookies={SESSION_COOKIE_NAME: viewer_token})
+            assert viewer_sim.status_code == 403
+
+            # Login as OPERATOR
+            op_login = await c.post(
+                "/api/auth/login",
+                json={"email": "operator-e2e@recoverai.local", "password": "operator-pass-123"},
+            )
+            assert op_login.status_code == 200
+            op_token = _cookie_value(op_login)
+
+            # OPERATOR has access to run simulation and read operations
+            op_dash = await c.get("/api/dashboard/summary", cookies={SESSION_COOKIE_NAME: op_token})
+            assert op_dash.status_code == 200
+            op_sim = await c.post(
+                "/api/dev/simulate-payment-failure",
+                json={"scenario": "LOW_VALUE_TRANSIENT"},
+                cookies={SESSION_COOKIE_NAME: op_token},
+            )
+            assert op_sim.status_code == 200
