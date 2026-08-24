@@ -50,6 +50,34 @@ class Settings(BaseSettings):
     # Must be >= 1 to prevent a busy loop.
     SCHEDULER_INTERVAL_SECONDS: int = 30
 
+    # Milestone 14A: Authentication & Authorization settings
+    # Session cookie lives at most SESSION_COOKIE_TTL_SECONDS (8h absolute TTL)
+    # and is invalidated after SESSION_IDLE_TTL_SECONDS (30m) of inactivity.
+    # last_seen_at is refreshed at most once per minute per session to avoid a
+    # write on every authenticated request.
+    SESSION_COOKIE_TTL_SECONDS: int = 28800
+    SESSION_IDLE_TTL_SECONDS: int = 1800
+    SESSION_LAST_SEEN_THROTTLE_SECONDS: int = 60
+
+    # Login brute-force protection (login endpoint only). Failures are tracked
+    # per-account AND per-client-IP; a key is locked out for
+    # LOGIN_LOCKOUT_SECONDS once it reaches LOGIN_MAX_ATTEMPTS failures within
+    # LOGIN_ATTEMPT_WINDOW_SECONDS.
+    LOGIN_MAX_ATTEMPTS: int = 5
+    LOGIN_ATTEMPT_WINDOW_SECONDS: int = 900
+    LOGIN_LOCKOUT_SECONDS: int = 900
+
+    # Comma-separated list of allowed Host headers for TrustedHostMiddleware.
+    # Production must pin the real hostname(s) (e.g. "api.recoverai.example").
+    # An empty value disables the host filter (dev/test convenience) — the
+    # production startup assertion rejects an unsafe combination.
+    TRUSTED_HOSTS: str = ""
+
+    # The cookie is sent on requests to these origins (same-origin or sibling
+    # subdomains of the same registrable domain). Used for server-side
+    # Origin/Referer validation on state-changing endpoints.
+    ALLOWED_ORIGINS: str = ""
+
     @field_validator("SCHEDULER_INTERVAL_SECONDS")
     @classmethod
     def _validate_interval(cls, v: int) -> int:
@@ -79,6 +107,20 @@ class Settings(BaseSettings):
                 )
         return v
 
+    @field_validator(
+        "SESSION_COOKIE_TTL_SECONDS",
+        "SESSION_IDLE_TTL_SECONDS",
+        "SESSION_LAST_SEEN_THROTTLE_SECONDS",
+        "LOGIN_MAX_ATTEMPTS",
+        "LOGIN_ATTEMPT_WINDOW_SECONDS",
+        "LOGIN_LOCKOUT_SECONDS",
+    )
+    @classmethod
+    def _validate_positive_int(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"{cls.__name__} setting must be >= 1, got {v}")
+        return v
+
     @property
     def cors_origins_list(self) -> list[str]:
         """Parse CORS_ORIGINS into a clean list of origins.
@@ -87,6 +129,21 @@ class Settings(BaseSettings):
         parser is safe for empty, whitespace-padded, and trailing-comma input.
         """
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
+    @property
+    def trusted_hosts_list(self) -> list[str]:
+        """Parse TRUSTED_HOSTS into a clean list of hosts."""
+        return [h.strip() for h in self.TRUSTED_HOSTS.split(",") if h.strip()]
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        """Parse ALLOWED_ORIGINS into a clean list of origins.
+
+        Used by the CSRF Origin/Referer validation. The deployment assumption
+        is same-origin or sibling subdomains under one registrable domain;
+        cross-site flows are unsupported until SameSite=None + full CSRF.
+        """
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

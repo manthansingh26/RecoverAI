@@ -39,10 +39,15 @@ import {
   formatDate,
   timeAgo,
 } from '../utils/format';
+import { useAuth } from '../auth/AuthContext';
 
 export default function RecoveryCaseDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+
+  // Role-aware: VIEWERs can read a case but cannot act on it.
+  const { hasRole } = useAuth();
+  const canOperate = hasRole(['OPERATOR', 'ADMIN']);
 
   const [activeStatus, setActiveStatus] = useState<string | null>(null);
   const isCaseActive = activeStatus === null || !['RESOLVED_SUCCESS', 'RESOLVED_FAILED'].includes(activeStatus);
@@ -331,23 +336,29 @@ export default function RecoveryCaseDetailPage() {
                 Simulate customer completing the recovery checkout via Razorpay Checkout Modal.
               </p>
             </div>
-            <button
-              onClick={handleLaunchRecoveryCheckout}
-              disabled={checkoutLoading}
-              className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-all hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-50"
-            >
-              {checkoutLoading ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  <span>Preparing Checkout...</span>
-                </>
-              ) : (
-                <>
-                  <CreditCard className="h-3.5 w-3.5" />
-                  <span>Complete Recovery Checkout (Test Mode)</span>
-                </>
-              )}
-            </button>
+            {canOperate ? (
+              <button
+                onClick={handleLaunchRecoveryCheckout}
+                disabled={checkoutLoading}
+                className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-xs font-semibold text-white shadow-sm transition-all hover:bg-emerald-500 active:scale-[0.98] disabled:opacity-50"
+              >
+                {checkoutLoading ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <span>Preparing Checkout...</span>
+                  </>
+                ) : (
+                  <>
+                    <CreditCard className="h-3.5 w-3.5" />
+                    <span>Complete Recovery Checkout (Test Mode)</span>
+                  </>
+                )}
+              </button>
+            ) : (
+              <span className="text-xs text-text-muted">
+                Viewer role — checkout requires an operator.
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -384,22 +395,30 @@ export default function RecoveryCaseDetailPage() {
                 automatic recovery execution.
               </p>
               <div className="mt-4 flex flex-wrap gap-3">
-                <button
-                  onClick={() => setApproveModalOpen(true)}
-                  disabled={actionLoading}
-                  className="flex items-center gap-2 rounded-lg bg-green-500/15 px-4 py-2.5 text-sm font-semibold text-green-400 transition-colors hover:bg-green-500/25 disabled:opacity-50"
-                >
-                  <CheckCircle2 className="h-4 w-4" />
-                  Approve Recovery
-                </button>
-                <button
-                  onClick={() => setRejectModalOpen(true)}
-                  disabled={actionLoading}
-                  className="flex items-center gap-2 rounded-lg bg-red-500/15 px-4 py-2.5 text-sm font-semibold text-red-400 transition-colors hover:bg-red-500/25 disabled:opacity-50"
-                >
-                  <XCircle className="h-4 w-4" />
-                  Reject Recovery
-                </button>
+                {canOperate ? (
+                  <>
+                    <button
+                      onClick={() => setApproveModalOpen(true)}
+                      disabled={actionLoading}
+                      className="flex items-center gap-2 rounded-lg bg-green-500/15 px-4 py-2.5 text-sm font-semibold text-green-400 transition-colors hover:bg-green-500/25 disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="h-4 w-4" />
+                      Approve Recovery
+                    </button>
+                    <button
+                      onClick={() => setRejectModalOpen(true)}
+                      disabled={actionLoading}
+                      className="flex items-center gap-2 rounded-lg bg-red-500/15 px-4 py-2.5 text-sm font-semibold text-red-400 transition-colors hover:bg-red-500/25 disabled:opacity-50"
+                    >
+                      <XCircle className="h-4 w-4" />
+                      Reject Recovery
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs text-text-muted">
+                    Viewer role — approval requires an operator.
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -576,14 +595,20 @@ export default function RecoveryCaseDetailPage() {
                 financial action will occur in simulation mode. This endpoint is
                 only available in development/test environments.
               </p>
-              <button
-                onClick={() => setExecuteModalOpen(true)}
-                disabled={actionLoading}
-                className="mt-3 flex items-center gap-2 rounded-lg bg-amber-500/15 px-4 py-2.5 text-sm font-semibold text-amber-400 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
-              >
-                <PlayCircle className="h-4 w-4" />
-                Run Simulation
-              </button>
+              {canOperate ? (
+                <button
+                  onClick={() => setExecuteModalOpen(true)}
+                  disabled={actionLoading}
+                  className="mt-3 flex items-center gap-2 rounded-lg bg-amber-500/15 px-4 py-2.5 text-sm font-semibold text-amber-400 transition-colors hover:bg-amber-500/25 disabled:opacity-50"
+                >
+                  <PlayCircle className="h-4 w-4" />
+                  Run Simulation
+                </button>
+              ) : (
+                <p className="mt-3 text-xs text-text-muted">
+                  Viewer role — running a simulation requires an operator.
+                </p>
+              )}
             </div>
           </div>
         </div>

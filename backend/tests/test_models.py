@@ -179,7 +179,7 @@ class TestExecutionLogModel:
 
 class TestRegistry:
     def test_expected_table_count(self) -> None:
-        """Ensure exactly the 4 core tables are registered."""
+        """Ensure exactly the 6 core tables are registered."""
         table_names = {
             name for name, _ in Base.metadata.tables.items()
             if name != "alembic_version"
@@ -189,4 +189,6 @@ class TestRegistry:
             "payment_events",
             "recovery_cases",
             "execution_logs",
+            "operators",
+            "sessions",
         }

@@ -10,12 +10,15 @@ Does NOT run in production.
 
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.deps import require_origin, require_permission
 from app.core.config import settings
+from app.core.roles import Permission
 from app.db.session import get_db
+from app.models.operator import Operator
 from app.services.recovery_workflow import (
     WorkflowSummary,
     discover_and_execute_due_cases,
@@ -80,9 +83,13 @@ def _summary_to_response(summary: WorkflowSummary) -> WorkflowResponse:
     )
 
 
-@router.post("/api/dev/process-recovery-workflow")
+@router.post(
+    "/api/dev/process-recovery-workflow",
+    dependencies=[Depends(require_origin)],
+)
 async def process_recovery_workflow(
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.RUN_WORKFLOW)),
 ) -> WorkflowResponse:
     """Manually trigger recovery workflow processing for development/testing.
 
@@ -91,9 +98,11 @@ async def process_recovery_workflow(
     - Processes all eligible RECEIVED cases through the Decision Engine.
     - Discovers and executes due PENDING_EXECUTION cases.
     - In SIMULATION mode (default), no real financial actions occur.
+    - Requires RUN_WORKFLOW permission. Actor recorded on executions.
 
     Args:
         db: Database session dependency.
+        operator: Authenticated operator.
 
     Returns:
         WorkflowResponse with processing and execution results.
@@ -102,8 +111,6 @@ async def process_recovery_workflow(
         HTTPException 404: Workflow endpoint not available outside dev/test.
     """
     if not _is_workflow_enabled():
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=404,
             detail="Workflow endpoint not available in this environment",
@@ -112,8 +119,10 @@ async def process_recovery_workflow(
     # Process RECEIVED cases
     received_summary = process_received_cases(db)
 
-    # Discover and execute due PENDING_EXECUTION cases
-    exec_summary = discover_and_execute_due_cases(db)
+    # Discover and execute due PENDING_EXECUTION cases (audited to this operator)
+    exec_summary = discover_and_execute_due_cases(
+        db, actor=operator.email
+    )
 
     # Combine results
     combined = WorkflowSummary(

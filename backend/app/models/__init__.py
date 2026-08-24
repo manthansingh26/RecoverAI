@@ -5,6 +5,8 @@ from app.models.customer import Customer
 from app.models.payment_event import PaymentEvent
 from app.models.recovery_case import RecoveryCase
 from app.models.execution_log import ExecutionLog
+from app.models.operator import Operator
+from app.models.session import AuthSession
 from app.models.enums import (
     ExecutionMode,
     ExecutionStatus,
@@ -19,6 +21,8 @@ __all__ = [
     "PaymentEvent",
     "RecoveryCase",
     "ExecutionLog",
+    "Operator",
+    "AuthSession",
     "ExecutionMode",
     "ExecutionStatus",
     "FailureCategory",

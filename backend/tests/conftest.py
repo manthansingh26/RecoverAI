@@ -2,17 +2,23 @@
 
 import hashlib
 import hmac
-import json
 import os
+import uuid
+
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
+from app.core.roles import OperatorRole
+from app.core.security import hash_password
 from app.db.session import get_db
 from app.main import app
 from app.models.base import Base
+from app.models.operator import Operator
+from app.api.deps import get_current_operator
 
 # Test database — use the same PostgreSQL credentials but a separate database
 # to avoid polluting development data.
@@ -64,6 +70,39 @@ def _setup_test_database() -> None:
     test_engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _default_auth_override() -> None:
+    """Provide a default authenticated ADMIN operator to every test.
+
+    Milestone 14A: protected routes require operator auth. Existing tests
+    (pre-14A) make unauthenticated requests; this override keeps them green.
+    New auth tests pop ``app.dependency_overrides[get_current_operator]`` to
+    exercise REAL authentication (see tests/test_auth.py).
+
+    The default operator is a lightweight in-memory object — routes only read
+    ``email``/``role`` for authorization and audit attribution.
+    """
+    default_operator = Operator(
+        id=uuid.uuid4(),
+        email="test@recoverai.local",
+        password_hash=hash_password("test-password-123!"),
+        role=OperatorRole.ADMIN.value,
+        enabled=True,
+        must_change_password=False,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    app.dependency_overrides[get_current_operator] = (
+        lambda: default_operator
+    )
+
+    yield
+
+    # Clear ALL overrides so a later test starts clean (db_session also sets
+    # its own get_db override for the tests that request it).
+    app.dependency_overrides.clear()
+
+
 @pytest.fixture()
 def db_session() -> Session:
     """Provide a transactional database session for a single test.
@@ -78,7 +117,12 @@ def db_session() -> Session:
     # Clean data tables before each test to avoid cross-test contamination
     # (some services call db.commit() internally, persisting across sessions)
     with test_engine.connect() as conn:
-        conn.execute(text("TRUNCATE execution_logs, recovery_cases, payment_events, customers CASCADE"))
+        conn.execute(
+            text(
+                "TRUNCATE execution_logs, recovery_cases, payment_events, "
+                "customers, sessions, operators CASCADE"
+            )
+        )
         conn.commit()
 
     # Override the get_db dependency for FastAPI test client
@@ -95,7 +139,7 @@ def db_session() -> Session:
     # Rollback after test to ensure isolation
     session.rollback()
     session.close()
-    app.dependency_overrides.clear()
+    app.dependency_overrides.pop(get_db, None)
     test_engine.dispose()
 
 

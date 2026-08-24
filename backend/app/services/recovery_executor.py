@@ -359,6 +359,7 @@ def execute_single_case(
     recovery_case_id: str,
     *,
     sim_behavior: SimulationBehavior | None = None,
+    actor: str | None = None,
 ) -> ExecutionResult | None:
     """Execute a single eligible RecoveryCase.
 
@@ -369,12 +370,17 @@ def execute_single_case(
         db: Active database session.
         recovery_case_id: UUID string of the RecoveryCase.
         sim_behavior: Optional simulation behavior override for testing.
+        actor: Optional actor identifier for audit attribution. Defaults to
+               "system:scheduler" when None (scheduler/webhook path).
 
     Returns:
         ExecutionResult or None if case not found.
     """
     if sim_behavior is None:
         sim_behavior = get_simulation_behavior()
+
+    if actor is None:
+        actor = "system:scheduler"
 
     try:
         rc_uuid = uuid.UUID(recovery_case_id)
@@ -438,6 +444,9 @@ def execute_single_case(
         req_data = {"strategy": strategy, "mode": mode.value}
         resp_data = {"blocked": True, "reason": f"Unknown strategy: {strategy}"}
         error_msg = f"Unknown strategy: {strategy}"
+
+    # Audit attribution — record who triggered this execution (Milestone 14A).
+    req_data = {**req_data, "actor": actor}
 
     # Create ExecutionLog
     log = _create_execution_log(
@@ -535,6 +544,7 @@ def execute_due_cases(
     db: Session,
     *,
     sim_behavior: SimulationBehavior | None = None,
+    actor: str | None = None,
 ) -> ExecutionSummary:
     """Execute all eligible PENDING_EXECUTION cases.
 
@@ -544,6 +554,9 @@ def execute_due_cases(
     Args:
         db: Active database session.
         sim_behavior: Optional simulation behavior override for testing.
+        actor: Optional actor identifier for audit attribution. Defaults to
+               "system:scheduler" (each execute_single_case applies its own
+               default when None).
 
     Returns:
         ExecutionSummary with counts and per-case results.
@@ -561,7 +574,9 @@ def execute_due_cases(
 
     results: list[ExecutionResult] = []
     for rc in due_cases:
-        result = execute_single_case(db, str(rc.id), sim_behavior=sim_behavior)
+        result = execute_single_case(
+            db, str(rc.id), sim_behavior=sim_behavior, actor=actor
+        )
         if result is not None:
             results.append(result)
 

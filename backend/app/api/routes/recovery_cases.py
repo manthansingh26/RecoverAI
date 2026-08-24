@@ -19,9 +19,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_operator, require_origin, require_permission
 from app.core.config import settings
+from app.core.roles import Permission
 from app.db.session import get_db
 from app.models.enums import RecoveryStatus
+from app.models.operator import Operator
 from app.models.recovery_case import RecoveryCase
 from app.schemas.recovery_case import (
     ExecutionLogSummary,
@@ -35,14 +38,16 @@ from app.schemas.recovery_case import (
     RecoveryCheckoutResponse,
     ReviewActionResponse,
 )
+from app.services.authz import (
+    get_case_for_operator,
+    get_execution_logs_for_operator,
+    list_cases_for_operator,
+)
 from app.services.payment_service import create_razorpay_order_internal
 from app.services.recovery_executor import execute_single_case
 from app.services.recovery_review import (
     approve_case,
-    get_case_detail,
     get_execution_logs,
-    get_dashboard_summary,
-    list_recovery_cases,
     reject_case,
 )
 
@@ -145,6 +150,7 @@ async def list_cases(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.VIEW_CASES)),
 ) -> RecoveryCaseListResponse:
     """List recovery cases with optional filtering and pagination.
 
@@ -154,13 +160,14 @@ async def list_cases(
     - requires_human_approval: boolean
     - approved_by_human: boolean or null
 
-    Returns paginated results with metadata.
+    Requires VIEW_CASES permission. Returns paginated results with metadata.
     """
     page = _clamp_page(page)
     page_size = _clamp_page_size(page_size)
 
-    cases, total = list_recovery_cases(
+    cases, total = list_cases_for_operator(
         db,
+        operator,
         status=status,
         strategy=strategy,
         requires_human_approval=requires_human_approval,
@@ -185,6 +192,7 @@ async def list_cases(
 async def get_case(
     recovery_case_id: str,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.VIEW_CASES)),
 ) -> RecoveryCaseDetail:
     """Get detailed recovery case information.
 
@@ -193,10 +201,13 @@ async def get_case(
     - Related payment event summary
     - Recent execution logs (last 10)
     - Decision audit trail
+
+    Requires VIEW_CASES permission. Returns 404 for both nonexistent cases
+    and cases the operator cannot access (no existence oracle).
     """
     _validate_uuid(recovery_case_id)
 
-    rc = get_case_detail(db, recovery_case_id)
+    rc = get_case_for_operator(db, recovery_case_id, operator)
     if rc is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
@@ -239,23 +250,24 @@ async def get_logs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.VIEW_EXECUTION_LOGS)),
 ) -> ExecutionLogsResponse:
     """Get paginated execution logs for a recovery case.
 
-    Returns logs ordered newest first.
+    Returns logs ordered newest first. Requires VIEW_EXECUTION_LOGS.
     """
     _validate_uuid(recovery_case_id)
 
-    # Verify case exists
-    rc = get_case_detail(db, recovery_case_id)
+    # Verify case exists (returns 404 for nonexistent OR unauthorized)
+    rc = get_case_for_operator(db, recovery_case_id, operator)
     if rc is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
     page = _clamp_page(page)
     page_size = _clamp_page_size(page_size)
 
-    logs, total = get_execution_logs(
-        db, recovery_case_id, page=page, page_size=page_size
+    logs, total = get_execution_logs_for_operator(
+        db, recovery_case_id, operator, page=page, page_size=page_size
     )
 
     items = [_execution_log_to_summary(log) for log in logs]
@@ -270,20 +282,25 @@ async def get_logs(
 # POST /api/recovery-cases/{recovery_case_id}/approve
 # ---------------------------------------------------------------------------
 
-@router.post("/api/recovery-cases/{recovery_case_id}/approve")
+@router.post(
+    "/api/recovery-cases/{recovery_case_id}/approve",
+    dependencies=[Depends(require_origin)],
+)
 async def approve(
     recovery_case_id: str,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.APPROVE_CASE)),
 ) -> ReviewActionResponse:
     """Approve a recovery case requiring human review.
 
     - Idempotent: repeated approval returns success without corruption.
     - Concurrency-safe: uses row locking.
     - Does NOT execute any financial action.
+    - Requires APPROVE_CASE permission. Actor recorded in audit trail.
     """
     _validate_uuid(recovery_case_id)
 
-    result = approve_case(db, recovery_case_id)
+    result = approve_case(db, recovery_case_id, actor=operator.email)
     if result is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
@@ -303,20 +320,25 @@ async def approve(
 # POST /api/recovery-cases/{recovery_case_id}/reject
 # ---------------------------------------------------------------------------
 
-@router.post("/api/recovery-cases/{recovery_case_id}/reject")
+@router.post(
+    "/api/recovery-cases/{recovery_case_id}/reject",
+    dependencies=[Depends(require_origin)],
+)
 async def reject(
     recovery_case_id: str,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.REJECT_CASE)),
 ) -> ReviewActionResponse:
     """Reject a recovery case requiring human review.
 
     - Idempotent: repeated rejection returns success without corruption.
     - A rejected case transitions to RESOLVED_FAILED.
     - A rejected case can never be auto-executed.
+    - Requires REJECT_CASE permission. Actor recorded in audit trail.
     """
     _validate_uuid(recovery_case_id)
 
-    result = reject_case(db, recovery_case_id)
+    result = reject_case(db, recovery_case_id, actor=operator.email)
     if result is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
@@ -340,10 +362,14 @@ def _is_dev_or_test() -> bool:
     return settings.APP_ENV in ("development", "test")
 
 
-@router.post("/api/recovery-cases/{recovery_case_id}/execute")
+@router.post(
+    "/api/recovery-cases/{recovery_case_id}/execute",
+    dependencies=[Depends(require_origin)],
+)
 async def manual_execute(
     recovery_case_id: str,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.EXECUTE_CASE)),
 ) -> ExecutionResponse:
     """Manually trigger execution of a recovery case.
 
@@ -351,6 +377,7 @@ async def manual_execute(
     Uses existing execute_single_case() with all safety checks intact.
     Does NOT bypass eligibility, human approval, or idempotency.
     Does NOT execute real financial actions.
+    Requires EXECUTE_CASE permission. Actor recorded in ExecutionLog.
     """
     if not _is_dev_or_test():
         raise HTTPException(
@@ -360,7 +387,7 @@ async def manual_execute(
 
     _validate_uuid(recovery_case_id)
 
-    result = execute_single_case(db, recovery_case_id)
+    result = execute_single_case(db, recovery_case_id, actor=operator.email)
     if result is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
@@ -399,10 +426,12 @@ def _lock_recovery_case(db: Session, case_uuid: uuid.UUID) -> RecoveryCase | Non
     response_model=RecoveryCheckoutResponse,
     status_code=status.HTTP_200_OK,
     summary="Create or reuse a Razorpay Test recovery order for this case",
+    dependencies=[Depends(require_origin)],
 )
 def create_or_reuse_recovery_checkout(
     recovery_case_id: str,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.CREATE_RECOVERY_CHECKOUT)),
 ) -> RecoveryCheckoutResponse:
     """Create or reuse a Razorpay Test Mode recovery order for customer checkout.
 
@@ -573,6 +602,7 @@ def create_or_reuse_recovery_checkout(
         "currency": result.currency,
         "receipt": result.receipt,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": operator.email,
         "status": "created",
     }
     rc.decision_audit_trail = trail

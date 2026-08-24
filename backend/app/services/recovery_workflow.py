@@ -224,6 +224,7 @@ def discover_and_execute_due_cases(
     db: Session,
     *,
     sim_behavior: SimulationBehavior | None = None,
+    actor: str | None = None,
 ) -> WorkflowSummary:
     """Discover due PENDING_EXECUTION cases and execute them.
 
@@ -233,6 +234,8 @@ def discover_and_execute_due_cases(
     Args:
         db: Active database session.
         sim_behavior: Optional simulation behavior override for testing.
+        actor: Optional actor identifier for audit attribution on executions
+               (defaults to "system:scheduler").
 
     Returns:
         WorkflowSummary with due case and execution information.
@@ -241,7 +244,7 @@ def discover_and_execute_due_cases(
     due_cases = get_due_recovery_cases(db)
 
     # Execute eligible due cases
-    exec_summary = execute_due_cases(db, sim_behavior=sim_behavior)
+    exec_summary = execute_due_cases(db, sim_behavior=sim_behavior, actor=actor)
 
     # Build results from execution
     results: list[WorkflowResult] = []

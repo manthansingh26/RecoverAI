@@ -3,6 +3,17 @@
  * Based on: backend/app/schemas/recovery_case.py
  */
 
+// --- Authentication (Milestone 14A) ---
+
+export type OperatorRole = 'VIEWER' | 'OPERATOR' | 'ADMIN';
+
+export interface Operator {
+  id: string;
+  email: string;
+  role: OperatorRole;
+  must_change_password: boolean;
+}
+
 // --- Pagination ---
 
 export interface PaginationMeta {

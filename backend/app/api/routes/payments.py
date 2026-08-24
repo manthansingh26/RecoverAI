@@ -2,8 +2,11 @@
 
 import logging
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
+from app.api.deps import require_origin, require_permission
+from app.core.roles import Permission
+from app.models.operator import Operator
 from app.schemas.payment import CreateOrderRequest, CreateOrderResponse
 from app.services.payment_service import create_razorpay_order_internal
 
@@ -17,8 +20,12 @@ router = APIRouter(prefix="/api/payments", tags=["payments"])
     response_model=CreateOrderResponse,
     status_code=status.HTTP_200_OK,
     summary="Create a Razorpay Test Mode Order",
+    dependencies=[Depends(require_origin)],
 )
-def create_razorpay_order(payload: CreateOrderRequest) -> CreateOrderResponse:
+def create_razorpay_order(
+    payload: CreateOrderRequest,
+    operator: Operator = Depends(require_permission(Permission.CREATE_PAYMENT_ORDER)),
+) -> CreateOrderResponse:
     """Create a new order in Razorpay for frontend Checkout in Test Mode.
 
     Flow:
@@ -28,6 +35,7 @@ def create_razorpay_order(payload: CreateOrderRequest) -> CreateOrderResponse:
 
     Args:
         payload: CreateOrderRequest containing amount and optional receipt/notes.
+        operator: Authenticated operator (must hold CREATE_PAYMENT_ORDER).
 
     Returns:
         CreateOrderResponse containing key_id, order_id, amount (in paise), currency, and receipt.
@@ -38,11 +46,15 @@ def create_razorpay_order(payload: CreateOrderRequest) -> CreateOrderResponse:
     else:
         amount_paise = int(round(payload.amount))
 
+    # Audit attribution — record who created this order (Milestone 14A).
+    notes = dict(payload.notes or {})
+    notes["created_by"] = operator.email
+
     result = create_razorpay_order_internal(
         amount_paise=amount_paise,
         currency=payload.currency,
         receipt=payload.receipt,
-        notes=payload.notes,
+        notes=notes,
     )
 
     return CreateOrderResponse(

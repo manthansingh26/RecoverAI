@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import {
   LayoutDashboard,
   FolderSearch,
@@ -6,16 +6,32 @@ import {
   Activity,
   Menu,
   X,
+  LogOut,
+  UserCircle2,
 } from 'lucide-react';
 import { useState } from 'react';
+import { useAuth } from '../auth/AuthContext';
 
 const NAV_ITEMS = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/recovery-cases', icon: FolderSearch, label: 'Recovery Cases' },
 ];
 
+const ROLE_BADGE_STYLES: Record<string, string> = {
+  ADMIN: 'bg-purple-500/10 text-purple-400 border-purple-500/30',
+  OPERATOR: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
+  VIEWER: 'bg-green-500/10 text-green-400 border-green-500/30',
+};
+
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  async function handleLogout() {
+    await logout();
+    navigate('/login', { replace: true });
+  }
 
   return (
     <div className="flex h-screen overflow-hidden bg-bg-primary">
@@ -95,6 +111,34 @@ export default function Layout() {
               </div>
             </div>
           </div>
+
+          {/* User info + logout */}
+          {user && (
+            <div className="border-t border-border px-4 py-4">
+              <div className="flex items-center gap-3 rounded-lg bg-bg-hover/50 px-3 py-2.5">
+                <UserCircle2 className="h-6 w-6 text-text-muted" />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-xs font-semibold text-text-primary">
+                    {user.email}
+                  </p>
+                  <span
+                    className={`inline-block rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider ${
+                      ROLE_BADGE_STYLES[user.role] ?? 'text-text-muted'
+                    }`}
+                  >
+                    {user.role}
+                  </span>
+                </div>
+                <button
+                  onClick={handleLogout}
+                  className="flex-shrink-0 rounded p-1 text-text-muted hover:bg-bg-hover hover:text-text-primary"
+                  title="Sign out"
+                >
+                  <LogOut className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </aside>
 

@@ -38,6 +38,7 @@ import {
   fetchDashboardActivity,
 } from '../api/dashboard';
 import { usePolling } from '../hooks/usePolling';
+import { useAuth } from '../auth/AuthContext';
 import type {
   ActivityFeed as ActivityFeedType,
   DashboardAnalytics as DashboardAnalyticsType,
@@ -244,6 +245,10 @@ export default function DashboardPage() {
   const [simulationOpen, setSimulationOpen] = useState(false);
   const [razorpayTestOpen, setRazorpayTestOpen] = useState(false);
 
+  // Role-aware: VIEWERs can read but not mutate (simulate / create orders).
+  const { hasRole } = useAuth();
+  const canOperate = hasRole(['OPERATOR', 'ADMIN']);
+
   const handleSimulationSuccess = useCallback(() => {
     refetch();
   }, [refetch]);
@@ -297,21 +302,25 @@ export default function DashboardPage() {
               lastUpdated={lastUpdated}
               intervalSec={15}
             />
-            <button
-              onClick={() => setRazorpayTestOpen(true)}
-              className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-sm font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 active:scale-[0.98]"
-              title="Creates a Razorpay Test Mode payment to test the real payment.failed → webhook → recovery pipeline."
-            >
-              <CreditCard className="h-3.5 w-3.5" />
-              Test Real Razorpay Payment
-            </button>
-            <button
-              onClick={() => setSimulationOpen(true)}
-              className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
-            >
-              <Sparkles className="h-3.5 w-3.5" />
-              Simulate Payment Failure
-            </button>
+            {canOperate && (
+              <>
+                <button
+                  onClick={() => setRazorpayTestOpen(true)}
+                  className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-sm font-semibold text-emerald-400 transition-all hover:bg-emerald-500/20 active:scale-[0.98]"
+                  title="Creates a Razorpay Test Mode payment to test the real payment.failed → webhook → recovery pipeline."
+                >
+                  <CreditCard className="h-3.5 w-3.5" />
+                  Test Real Razorpay Payment
+                </button>
+                <button
+                  onClick={() => setSimulationOpen(true)}
+                  className="flex items-center gap-2 rounded-lg bg-accent-blue px-3.5 py-2 text-sm font-semibold text-white transition-all hover:bg-accent-blue/90 active:scale-[0.98]"
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  Simulate Payment Failure
+                </button>
+              </>
+            )}
           </div>
         }
       />
@@ -332,22 +341,28 @@ export default function DashboardPage() {
                   No recovery activity yet
                 </h3>
                 <p className="mt-2 max-w-md text-sm text-text-muted">
-                  Use{' '}
-                  <button
-                    onClick={() => setRazorpayTestOpen(true)}
-                    className="font-semibold text-emerald-400 hover:underline"
-                  >
-                    Test Real Razorpay Payment
-                  </button>{' '}
-                  or{' '}
-                  <button
-                    onClick={() => setSimulationOpen(true)}
-                    className="font-semibold text-accent-blue hover:underline"
-                  >
-                    Simulate Payment Failure
-                  </button>{' '}
-                  to run a safe end-to-end RecoverAI scenario and generate real
-                  dashboard analytics.
+                  {canOperate ? (
+                    <>
+                      Use{' '}
+                      <button
+                        onClick={() => setRazorpayTestOpen(true)}
+                        className="font-semibold text-emerald-400 hover:underline"
+                      >
+                        Test Real Razorpay Payment
+                      </button>{' '}
+                      or{' '}
+                      <button
+                        onClick={() => setSimulationOpen(true)}
+                        className="font-semibold text-accent-blue hover:underline"
+                      >
+                        Simulate Payment Failure
+                      </button>{' '}
+                      to run a safe end-to-end RecoverAI scenario and generate
+                      real dashboard analytics.
+                    </>
+                  ) : (
+                    'No recovery activity has been generated yet. Request an operator to run a simulation.'
+                  )}
                 </p>
               </div>
             </div>

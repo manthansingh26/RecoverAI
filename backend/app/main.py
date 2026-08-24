@@ -5,7 +5,9 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
+from app.api.routes.auth import router as auth_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.health import router as health_router
 from app.api.routes.payments import router as payments_router
@@ -23,6 +25,46 @@ _DEV_CORS_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
+
+
+def _assert_production_safety() -> None:
+    """Refuse to start with an unsafe production configuration.
+
+    Called only when APP_ENV == "production". Raises RuntimeError (which
+    aborts startup) for combinations that would silently weaken security.
+    """
+    problems: list[str] = []
+
+    if not settings.RAZORPAY_WEBHOOK_SECRET:
+        problems.append("RAZORPAY_WEBHOOK_SECRET must be set in production")
+    if not settings.trusted_hosts_list:
+        problems.append(
+            "TRUSTED_HOSTS must be set in production (TrustedHostMiddleware "
+            "is disabled when empty)"
+        )
+    if settings.DATABASE_URL.startswith(
+        "postgresql+psycopg://recoverai:recoverai@localhost"
+    ):
+        problems.append(
+            "DATABASE_URL must not be the default local development database "
+            "in production"
+        )
+    if settings.EXECUTION_MODE.upper() not in ("SIMULATION", "RAZORPAY"):
+        problems.append(
+            f"Invalid EXECUTION_MODE '{settings.EXECUTION_MODE}'"
+        )
+    if settings.SCHEDULER_ENABLED and settings.EXECUTION_MODE.upper() == "RAZORPAY":
+        problems.append(
+            "SCHEDULER_ENABLED with EXECUTION_MODE=RAZORPAY could trigger "
+            "real financial actions without explicit confirmation — refusing "
+            "to start. Set EXECUTION_MODE=SIMULATION or SCHEDULER_ENABLED=false."
+        )
+
+    if problems:
+        raise RuntimeError(
+            "Refusing to start RecoverAI in production with an unsafe "
+            "configuration:\n  - " + "\n  - ".join(problems)
+        )
 
 
 def _get_cors_origins() -> list[str]:
@@ -77,12 +119,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
+    # Refuse to start when the production configuration is unsafe.
+    if settings.APP_ENV == "production":
+        _assert_production_safety()
+
     app = FastAPI(
         title="RecoverAI",
         description="Event-driven payment recovery system",
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # TrustedHostMiddleware — only applies a Host allowlist when configured.
+    # The production startup assertion requires TRUSTED_HOSTS in production.
+    if settings.trusted_hosts_list:
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=settings.trusted_hosts_list,
+        )
 
     # CORS — only enabled when allowed origins are configured
     allowed_origins = _get_cors_origins()
@@ -97,6 +151,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(webhooks_router)
+    app.include_router(auth_router)
     app.include_router(simulation_router)
     app.include_router(workflow_router)
     app.include_router(recovery_cases_router)
@@ -105,7 +160,9 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     async def root() -> dict[str, str]:
-        return {"message": "RecoverAI API", "env": settings.APP_ENV}
+        # Public probe route. Intentionally does NOT leak APP_ENV or any
+        # other environment detail (Milestone 14A).
+        return {"message": "RecoverAI API"}
 
     return app
 

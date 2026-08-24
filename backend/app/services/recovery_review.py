@@ -288,6 +288,8 @@ def _resolve_post_approval_strategy(
 def approve_case(
     db: Session,
     recovery_case_id: str,
+    *,
+    actor: str | None = None,
 ) -> ReviewActionResult | None:
     """Approve a recovery case requiring human review.
 
@@ -297,6 +299,8 @@ def approve_case(
     Args:
         db: Active database session.
         recovery_case_id: UUID string of the RecoveryCase.
+        actor: Operator identifier for audit attribution (e.g. operator email
+               or "system:scheduler"). If None, uses "unknown".
 
     Returns:
         ReviewActionResult or None if case not found.
@@ -345,6 +349,14 @@ def approve_case(
 
     # Perform approval
     rc.approved_by_human = True
+
+    # Audit attribution — record who approved this case (Milestone 14A).
+    trail = copy.deepcopy(rc.decision_audit_trail or {})
+    trail["approved_by"] = {
+        "actor": actor or "unknown",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    rc.decision_audit_trail = trail
 
     # Record original strategy before any resolution
     original_strategy = rc.recommended_strategy
@@ -420,6 +432,8 @@ def approve_case(
 def reject_case(
     db: Session,
     recovery_case_id: str,
+    *,
+    actor: str | None = None,
 ) -> ReviewActionResult | None:
     """Reject a recovery case requiring human review.
 
@@ -429,6 +443,7 @@ def reject_case(
     Args:
         db: Active database session.
         recovery_case_id: UUID string of the RecoveryCase.
+        actor: Operator identifier for audit attribution. If None, "unknown".
 
     Returns:
         ReviewActionResult or None if case not found.
@@ -465,6 +480,14 @@ def reject_case(
 
     # Perform rejection
     rc.approved_by_human = False
+
+    # Audit attribution — record who rejected this case (Milestone 14A).
+    trail = copy.deepcopy(rc.decision_audit_trail or {})
+    trail["rejected_by"] = {
+        "actor": actor or "unknown",
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    rc.decision_audit_trail = trail
 
     # Transition to RESOLVED_FAILED — rejected cases stop recovery
     rc.status = RecoveryStatus.RESOLVED_FAILED.value

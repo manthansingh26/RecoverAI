@@ -20,8 +20,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.deps import require_origin, require_permission
 from app.core.config import settings
+from app.core.roles import Permission
 from app.db.session import get_db
+from app.models.operator import Operator
 from app.schemas.simulation import (
     ExecutionResultItem,
     ScenarioSimulationRequest,
@@ -99,10 +102,14 @@ def _get_scenario_params(scenario: SimulationScenario) -> dict[str, Any]:
 # POST /api/dev/simulate/payment-failed (existing raw endpoint — unchanged)
 # ---------------------------------------------------------------------------
 
-@router.post("/api/dev/simulate/payment-failed")
+@router.post(
+    "/api/dev/simulate/payment-failed",
+    dependencies=[Depends(require_origin)],
+)
 async def simulate_payment_failed(
     request: SimulationRequest,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.RUN_SIMULATION)),
 ) -> WebhookResponse:
     """Simulate a payment.failed event for development/testing.
 
@@ -112,10 +119,12 @@ async def simulate_payment_failed(
     - Does NOT bypass or weaken the real webhook route.
     - Creates PaymentEvent + RecoveryCase using identical persistence rules.
     - Handles duplicate simulation event IDs idempotently.
+    - Requires RUN_SIMULATION permission (operator).
 
     Args:
         request: Simulation payload with optional event_id and payment details.
         db: Database session dependency.
+        operator: Authenticated operator.
 
     Returns:
         WebhookResponse indicating acceptance and duplicate status.
@@ -202,10 +211,14 @@ async def simulate_payment_failed(
 # POST /api/dev/simulate-payment-failure (Milestone 8 scenario endpoint)
 # ---------------------------------------------------------------------------
 
-@router.post("/api/dev/simulate-payment-failure")
+@router.post(
+    "/api/dev/simulate-payment-failure",
+    dependencies=[Depends(require_origin)],
+)
 async def simulate_payment_failure_scenario(
     request: ScenarioSimulationRequest,
     db: Session = Depends(get_db),
+    operator: Operator = Depends(require_permission(Permission.RUN_SIMULATION)),
 ) -> SimulationResult:
     """Simulate a complete payment failure recovery pipeline for a pre-defined scenario.
 
@@ -220,10 +233,12 @@ async def simulate_payment_failure_scenario(
     Only available in development/test environments.
     Does NOT bypass policy, human approval, or safety checks.
     Does NOT execute real financial actions.
+    Requires RUN_SIMULATION permission (operator).
 
     Args:
         request: Scenario selection.
         db: Database session dependency.
+        operator: Authenticated operator.
 
     Returns:
         SimulationResult with full pipeline outcome.
@@ -343,7 +358,7 @@ async def simulate_payment_failure_scenario(
     #    If it REQUIRES_HUMAN, do NOT bypass — leave as-is.
     execution_item: ExecutionResultItem | None = None
     if rc.status == "PENDING_EXECUTION":
-        exec_result = execute_single_case(db, recovery_case_id)
+        exec_result = execute_single_case(db, recovery_case_id, actor=operator.email)
         if exec_result is not None:
             execution_item = ExecutionResultItem(
                 strategy=exec_result.strategy,

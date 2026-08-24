@@ -29,4 +29,4 @@ async def test_root_endpoint() -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["message"] == "RecoverAI API"
-    assert "env" in data
+    assert "env" not in data  # Milestone 14A: must not leak APP_ENV

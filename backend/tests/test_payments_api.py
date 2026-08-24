@@ -242,5 +242,6 @@ class TestCreateRazorpayOrder:
             assert call_kwargs["data"]["notes"] == {
                 "purpose": "test_checkout",
                 "customer_id": "cust_123",
+                "created_by": "test@recoverai.local",  # Milestone 14A audit attribution
             }
             assert call_kwargs["data"]["receipt"].startswith("rcpt_")
