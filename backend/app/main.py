@@ -17,17 +17,29 @@ from app.core.config import settings
 from app.services.recovery_scheduler import RecoveryScheduler
 
 
+_DEV_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+
 def _get_cors_origins() -> list[str]:
-    """Return allowed CORS origins based on environment."""
+    """Return allowed CORS origins based on environment.
+
+    Development/test: allow the local frontend origins (unchanged behavior).
+    Production: allow ONLY the origins explicitly configured in CORS_ORIGINS.
+    An empty CORS_ORIGINS in production disables cross-origin access entirely
+    (the middleware is only registered when the list is non-empty).
+
+    "*" is never allowed: the middleware uses allow_credentials=True, and a
+    wildcard origin combined with credentials is a security anti-pattern.
+    """
     if settings.APP_ENV in ("development", "test"):
-        return [
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        ]
-    # Production: restrict to known frontend origins
-    return []
+        return list(_DEV_CORS_ORIGINS)
+    # Production: allowed origins come ONLY from the configured CORS_ORIGINS.
+    return settings.cors_origins_list
 
 
 @asynccontextmanager

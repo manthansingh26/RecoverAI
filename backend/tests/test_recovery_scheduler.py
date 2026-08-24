@@ -494,6 +494,50 @@ class TestIdempotencyAcrossRepeatedCycles:
         ).all()
         assert len(logs) == 1
 
+    def test_still_due_case_blocked_by_idempotency_key(self, db_session):
+        """A race where two cycles observe the same pre-increment state cannot
+        double-execute the same retry attempt.
+
+        The idempotency key is derived from (case_id, retry_count, strategy).
+        If a second scheduler cycle reads the case before the first commits its
+        retry_count increment — the classic double-run window — both compute the
+        same key. The unique constraint on ExecutionLog.idempotency_key forces a
+        rollback for the loser, which is reported as BLOCKED and never creates a
+        second execution record.
+        """
+        pe = _make_payment_event(db_session, amount_paise=50000)
+        rc = _make_recovery_case(
+            db_session, pe,
+            strategy=RecoveryStrategy.WAIT_AND_RETRY.value,
+            retry_count=0,
+            next_run_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+        )
+
+        # First cycle — executes (retry_count 0 -> 1, next_run_at pushed out).
+        summary1 = run_one_cycle(db=db_session)
+        assert summary1.attempted >= 1
+
+        # Simulate the race: a second cycle reads the case BEFORE the first
+        # cycle's retry_count increment became visible. Restore the
+        # pre-increment state (retry_count=0, still due) so both cycles would
+        # compute the identical idempotency key.
+        db_session.refresh(rc)
+        rc.retry_count = 0
+        rc.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+        db_session.commit()
+
+        # Second cycle — same key collision → skipped, reported as BLOCKED,
+        # and NOT counted as an execution attempt.
+        summary2 = run_one_cycle(db=db_session)
+        assert summary2.attempted == 0
+        assert summary2.blocked >= 1
+
+        # Exactly one execution log survives: the first attempt only.
+        logs = db_session.query(ExecutionLog).filter(
+            ExecutionLog.recovery_case_id == rc.id
+        ).all()
+        assert len(logs) == 1
+
 
 # ---------------------------------------------------------------------------
 # Test 15: Graceful shutdown — five precise behavioural scenarios

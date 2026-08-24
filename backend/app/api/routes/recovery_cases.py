@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -378,6 +379,21 @@ async def manual_execute(
 # POST /api/recovery-cases/{recovery_case_id}/recovery-checkout (Milestone 12)
 # ---------------------------------------------------------------------------
 
+def _lock_recovery_case(db: Session, case_uuid: uuid.UUID) -> RecoveryCase | None:
+    """Fetch a RecoveryCase by id, taking a blocking row-level PostgreSQL lock.
+
+    Uses `with_for_update()` (blocking) rather than `skip_locked=True` so a
+    concurrent checkout request WAITS for the lock holder to finish instead of
+    skipping the row (which would surface a false 404). This serializes
+    concurrent checkouts against the same case.
+    """
+    return db.execute(
+        select(RecoveryCase)
+        .where(RecoveryCase.id == case_uuid)
+        .with_for_update()
+    ).scalar_one_or_none()
+
+
 @router.post(
     "/api/recovery-cases/{recovery_case_id}/recovery-checkout",
     response_model=RecoveryCheckoutResponse,
@@ -400,10 +416,32 @@ def create_or_reuse_recovery_checkout(
        notes.recovery_case_id and notes.original_order_id.
     6. Persists recovery-order metadata inside decision_audit_trail["recovery_order"].
     7. Never returns RAZORPAY_KEY_SECRET.
+
+    Concurrency design (double-checked creation):
+
+      Phase A — row lock, read-only.
+        Take a blocking `SELECT ... FOR UPDATE` on the RecoveryCase and check
+        for an existing recovery_order. This serializes concurrent requests so
+        only one can observe "no order exists" per lock hold.
+
+      Phase B — release the lock, then create the order.
+        The Razorpay order.create network call is made OUTSIDE the database
+        transaction so a slow upstream does not pin a DB row lock.
+
+      Phase C — re-lock and double-check.
+        Re-acquire the row lock and re-read decision_audit_trail. If a
+        concurrent request created an order while we were on the network, reuse
+        it; otherwise persist our own. Exactly one recovery_order is ever
+        persisted for a case.
+
+    This guarantees at most one ACTIVE recovery_order in the audit trail per
+    case. A concurrent loser may still have created an orphan Razorpay Test
+    order (Test Mode only) but never persists or returns it.
     """
     case_uuid = _validate_uuid(recovery_case_id)
 
-    rc = db.get(RecoveryCase, case_uuid)
+    # --- Phase A: lock the row and check for an existing recovery order ---
+    rc = _lock_recovery_case(db, case_uuid)
     if rc is None:
         raise HTTPException(status_code=404, detail="Recovery case not found")
 
@@ -440,6 +478,8 @@ def create_or_reuse_recovery_checkout(
             existing_rec_order["order_id"],
             rc.id,
         )
+        # Commit to release the row lock before returning.
+        db.commit()
         return RecoveryCheckoutResponse(
             key_id=settings.RAZORPAY_KEY_ID,
             order_id=existing_rec_order["order_id"],
@@ -450,22 +490,83 @@ def create_or_reuse_recovery_checkout(
             is_reused=True,
         )
 
-    # Create a new Razorpay Test Order with attached metadata notes
-    receipt = f"rcpt_rec_{str(rc.id)[:12]}"
+    # Capture everything needed to build the order before releasing the lock,
+    # because committing expires the ORM instance.
+    case_id_str = str(rc.id)
+    amount_paise = pe.amount_paise
+    currency = pe.currency
+    original_order_id = pe.external_order_id or ""
+    retry_count = rc.retry_count
+
+    # --- Phase B: release the lock, then make the network call ---
+    db.commit()
+
+    receipt = f"rcpt_rec_{case_id_str[:12]}"
     notes = {
-        "recovery_case_id": str(rc.id),
-        "original_order_id": pe.external_order_id or "",
-        "recovery_attempt": str(rc.retry_count),
+        "recovery_case_id": case_id_str,
+        "original_order_id": original_order_id,
+        "recovery_attempt": str(retry_count),
     }
 
     result = create_razorpay_order_internal(
-        amount_paise=pe.amount_paise,
-        currency=pe.currency,
+        amount_paise=amount_paise,
+        currency=currency,
         receipt=receipt,
         notes=notes,
     )
 
-    # Persist recovery order metadata in decision_audit_trail
+    # --- Phase C: re-lock and double-check for a concurrent creation ---
+    rc = _lock_recovery_case(db, case_uuid)
+    if rc is None:
+        # Case deleted while the order was being created. Surface 404; the
+        # freshly-created Test order is left orphaned but never persisted.
+        logger.warning(
+            "Recovery case %s disappeared during order creation (order %s)",
+            case_id_str,
+            result.order_id,
+        )
+        raise HTTPException(status_code=404, detail="Recovery case not found")
+
+    # Re-verify terminal safety states against the freshly-locked row.
+    if rc.status in (
+        RecoveryStatus.RESOLVED_SUCCESS.value,
+        RecoveryStatus.RESOLVED_FAILED.value,
+    ):
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Recovery case is no longer open for checkout.",
+        )
+
+    trail = dict(rc.decision_audit_trail or {})
+    concurrent_order = trail.get("recovery_order")
+
+    if (
+        isinstance(concurrent_order, dict)
+        and concurrent_order.get("order_id")
+        and concurrent_order["order_id"] != result.order_id
+        and settings.RAZORPAY_KEY_ID
+    ):
+        # Another request won the race while we were on the network. Reuse it.
+        logger.info(
+            "Reusing concurrently-created recovery order %s for case %s "
+            "(discarding orphan order %s)",
+            concurrent_order["order_id"],
+            case_id_str,
+            result.order_id,
+        )
+        db.commit()
+        return RecoveryCheckoutResponse(
+            key_id=settings.RAZORPAY_KEY_ID,
+            order_id=concurrent_order["order_id"],
+            amount=concurrent_order.get("amount_paise", amount_paise),
+            currency=concurrent_order.get("currency", currency),
+            receipt=concurrent_order.get("receipt", receipt),
+            recovery_case_id=case_id_str,
+            is_reused=True,
+        )
+
+    # We own this case's order — persist the metadata.
     trail["recovery_order"] = {
         "order_id": result.order_id,
         "amount_paise": result.amount_paise,
@@ -480,7 +581,7 @@ def create_or_reuse_recovery_checkout(
     logger.info(
         "Created new recovery order %s for case %s (amount=%d paise)",
         result.order_id,
-        rc.id,
+        case_id_str,
         result.amount_paise,
     )
 
@@ -490,6 +591,6 @@ def create_or_reuse_recovery_checkout(
         amount=result.amount_paise,
         currency=result.currency,
         receipt=result.receipt,
-        recovery_case_id=str(rc.id),
+        recovery_case_id=case_id_str,
         is_reused=False,
     )

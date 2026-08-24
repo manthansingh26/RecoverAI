@@ -190,6 +190,93 @@ class TestWebhookIngestion:
             settings.RAZORPAY_WEBHOOK_SECRET = original_secret
 
     @pytest.mark.asyncio
+    async def test_stranded_received_case_self_healed_on_duplicate_delivery(
+        self, db_session
+    ) -> None:
+        """A case stuck in RECEIVED is re-processed even on a duplicate webhook retry.
+
+        Guards against the window where a prior delivery committed the event
+        during ingestion but failed before the decision engine ran, which would
+        otherwise leave the case stranded in RECEIVED forever (retries become
+        no-ops because duplicate ingestion skips the pipeline).
+        """
+        secret = settings.RAZORPAY_WEBHOOK_SECRET or "test_secret_123"
+        event_id = "evt_stranded_self_heal_001"
+
+        # Simulate the stranded state directly: event committed, case never
+        # advanced past RECEIVED (decision engine never ran).
+        pe = PaymentEvent(
+            event_type="payment.failed",
+            external_event_id=event_id,
+            external_payment_id="pay_stranded_001",
+            external_order_id="order_stranded_001",
+            amount_paise=100000,
+            currency="INR",
+            error_code="BAD_REQUEST_ERROR",
+            error_reason="authentication_failed",
+            error_description="Simulated stranded case",
+            raw_payload={"mock": "stranded"},
+            payload_hash="mock_hash",
+        )
+        db_session.add(pe)
+        db_session.flush()
+        stranded_rc = RecoveryCase(
+            payment_event_id=pe.id,
+            status=RecoveryStatus.RECEIVED.value,
+            failure_category=FailureCategory.UNKNOWN.value,
+            recommended_strategy=None,
+            retry_count=0,
+            requires_human_approval=False,
+            approved_by_human=None,
+            decision_audit_trail={
+                "ingestion": {
+                    "source": "razorpay_webhook",
+                    "event_id": event_id,
+                    "signature_verified": True,
+                }
+            },
+        )
+        db_session.add(stranded_rc)
+        db_session.commit()
+
+        # Capture before the request — the endpoint commits and the shared
+        # fixture session is closed when the request tears down.
+        pe_id = pe.id
+
+        body_bytes = json.dumps(make_valid_payment_failed_body()).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["duplicate"] is True
+            assert data["recovery_case_id"] is not None
+
+            # The case must have advanced out of RECEIVED despite the duplicate.
+            db_session.expire_all()
+            updated_rc = db_session.execute(
+                select(RecoveryCase).where(RecoveryCase.payment_event_id == pe_id)
+            ).scalar_one()
+            assert updated_rc.status != RecoveryStatus.RECEIVED.value
+            assert updated_rc.decision_audit_trail.get("classification") is not None
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
     async def test_missing_signature_rejected(self, db_session) -> None:
         """Missing signature header returns 401."""
         secret = settings.RAZORPAY_WEBHOOK_SECRET or "test_secret_123"

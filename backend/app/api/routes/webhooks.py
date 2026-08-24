@@ -10,7 +10,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -31,6 +31,95 @@ from app.services.webhook_security import verify_razorpay_signature
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def _read_webhook_body(request: Request, max_bytes: int) -> bytes:
+    """Read a webhook request body while enforcing a maximum size.
+
+    Two-layer guard that applies BEFORE the payload is fully buffered into
+    application memory:
+
+    1. Content-Length fast path — if the client declares a Content-Length
+       above the limit we reject immediately (413) without reading the body.
+
+    2. Streaming cap — the body is read incrementally via ``request.stream()``
+       and rejected as soon as the accumulated size exceeds the limit. This
+       covers chunked transfer, missing Content-Length, and clients that lie
+       about Content-Length.
+
+    The returned bytes are the exact raw payload, byte-for-byte identical to
+    what ``await request.body()`` would return, so HMAC verification semantics
+    are preserved (signature is computed over these raw bytes).
+
+    Note on honesty: this caps what the *application* buffers into Python
+    memory. The ASGI server (e.g. uvicorn) may still read the full wire body
+    into its own receive buffer before our handler runs, so this is
+    application-level protection — not a wire-level streaming guarantee.
+    """
+    # 1. Content-Length fast path
+    content_length_header = request.headers.get("content-length")
+    if content_length_header is not None:
+        try:
+            declared_length = int(content_length_header)
+        except ValueError:
+            # Malformed Content-Length — fall through to the streaming cap.
+            declared_length = None
+        if declared_length is not None and declared_length > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Webhook payload exceeds maximum size of {max_bytes} bytes",
+            )
+
+    # 2. Streaming cap (authoritative guard)
+    chunks: list[bytes] = []
+    total_bytes = 0
+    async for chunk in request.stream():
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Webhook payload exceeds maximum size of {max_bytes} bytes",
+            )
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+def _process_case_if_received(db: Session, recovery_case_id: str) -> None:
+    """Run the decision engine if a case is still stuck in RECEIVED.
+
+    Self-healing for the window where a prior webhook delivery committed the
+    event during ingestion but failed before decision-engine processing
+    completed — leaving the case stranded in RECEIVED and making Razorpay's
+    retry a no-op (duplicate ingestion skips the pipeline).
+
+    process_received_case is idempotent: it locks the row and skips any case
+    not in RECEIVED, so calling it here is safe for both fresh and duplicate
+    deliveries. Failures are swallowed so a self-heal attempt can never break
+    webhook acknowledgement.
+    """
+    try:
+        rc_uuid = uuid.UUID(recovery_case_id)
+    except ValueError:
+        logger.warning(
+            "Invalid recovery_case_id during self-heal: %s", recovery_case_id
+        )
+        return
+
+    try:
+        rc = db.get(RecoveryCase, rc_uuid)
+        if rc is not None and rc.status == RecoveryStatus.RECEIVED.value:
+            logger.info(
+                "Re-processing case %s stranded in RECEIVED state",
+                recovery_case_id,
+            )
+            process_received_case(db, recovery_case_id)
+    except Exception as e:
+        logger.warning(
+            "Self-heal re-processing failed for case %s: %s",
+            recovery_case_id,
+            e,
+        )
 
 
 @router.post("/webhooks/razorpay")
@@ -63,8 +152,11 @@ async def razorpay_webhook(
         HTTPException 401: Missing or invalid signature.
         HTTPException 400: Malformed payload or missing event ID.
     """
-    # 1. Read raw body bytes BEFORE any parsing
-    raw_body = await request.body()
+    # 1. Read raw body bytes BEFORE any parsing, with a size cap so an
+    #    arbitrarily large payload is never fully buffered into memory.
+    raw_body = await _read_webhook_body(
+        request, settings.RAZORPAY_WEBHOOK_MAX_BODY_BYTES
+    )
 
     # 2. Verify signature against raw body
     verification = verify_razorpay_signature(
@@ -174,26 +266,33 @@ async def razorpay_webhook(
             detail="Internal error processing webhook",
         )
 
-    # 10. If new case created (not duplicate), run the recovery intelligence pipeline
-    if not result.duplicate and result.recovery_case_id:
-        process_received_case(db, result.recovery_case_id)
+    # 10. Ensure the case advances through the recovery intelligence pipeline.
+    #     A previous delivery may have committed the event during ingestion but
+    #     failed before running the decision engine, stranding the case in
+    #     RECEIVED. _process_case_if_received is idempotent and re-processes
+    #     such cases even on duplicate deliveries (self-healing).
+    if result.recovery_case_id:
+        _process_case_if_received(db, result.recovery_case_id)
 
-        # Check if case transitioned to PENDING_EXECUTION and execution mode is SIMULATION
-        try:
-            rc_uuid = uuid.UUID(result.recovery_case_id)
-            rc = db.get(RecoveryCase, rc_uuid)
-            if (
-                rc is not None
-                and rc.status == RecoveryStatus.PENDING_EXECUTION.value
-                and settings.EXECUTION_MODE == "SIMULATION"
-            ):
-                execute_single_case(db, result.recovery_case_id)
-        except Exception as e:
-            logger.warning(
-                "Auto-execution check failed for case %s: %s",
-                result.recovery_case_id,
-                e,
-            )
+        # Auto-execute newly-processed PENDING_EXECUTION cases in SIMULATION
+        # mode. Development convenience only — runs for cases this request
+        # actually created (not on duplicate retries, to avoid re-executing).
+        if not result.duplicate:
+            try:
+                rc_uuid = uuid.UUID(result.recovery_case_id)
+                rc = db.get(RecoveryCase, rc_uuid)
+                if (
+                    rc is not None
+                    and rc.status == RecoveryStatus.PENDING_EXECUTION.value
+                    and settings.EXECUTION_MODE == "SIMULATION"
+                ):
+                    execute_single_case(db, result.recovery_case_id)
+            except Exception as e:
+                logger.warning(
+                    "Auto-execution check failed for case %s: %s",
+                    result.recovery_case_id,
+                    e,
+                )
 
     logger.info(
         "Webhook ingested and processed: event_id=%s duplicate=%s recovery_case_id=%s",

@@ -23,17 +23,21 @@ Tests cover all 20 specified scenarios:
 20. dashboard recovered revenue updates accurately on webhook resolution
 """
 
+import asyncio
 import hashlib
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.orm import sessionmaker
 
 from app.core.config import settings
+from app.db.session import get_db
 from app.main import app
 from app.models.enums import (
     ExecutionMode,
@@ -46,10 +50,11 @@ from app.models.execution_log import ExecutionLog
 from app.models.payment_event import PaymentEvent
 from app.models.recovery_case import RecoveryCase
 from app.services.payment_normalizer import normalize_payment_captured
+from app.services.payment_service import OrderCreationResult
 from app.services.recovery_resolver import resolve_recovery_by_payment
 from app.services.recovery_review import get_dashboard_activity, get_dashboard_analytics
 from app.services.webhook_security import verify_razorpay_signature
-from tests.conftest import make_razorpay_signature
+from tests.conftest import TEST_DATABASE_URL, make_razorpay_signature
 
 
 # ---------------------------------------------------------------------------
@@ -635,12 +640,15 @@ class TestRecoveryCheckoutEndpoint:
     async def test_recovery_checkout_creates_test_order_with_notes(self, db_session):
         """15. Recovery checkout endpoint creates Razorpay Test order tagged with case notes."""
         pe, rc = _create_test_case(db_session, amount_paise=150000)
+        # Capture before the request: the endpoint now commits and releases the
+        # row lock, expiring the fixture-session object after the response.
+        rc_id = str(rc.id)
 
         mock_order = {
             "id": "order_rec_mock_150",
             "amount": 150000,
             "currency": "INR",
-            "receipt": f"rcpt_rec_{str(rc.id)[:12]}",
+            "receipt": f"rcpt_rec_{rc_id[:12]}",
             "status": "created",
         }
 
@@ -656,7 +664,7 @@ class TestRecoveryCheckoutEndpoint:
             transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://testserver") as client:
                 resp = await client.post(
-                    f"/api/recovery-cases/{rc.id}/recovery-checkout",
+                    f"/api/recovery-cases/{rc_id}/recovery-checkout",
                 )
 
         assert resp.status_code == 200
@@ -664,16 +672,16 @@ class TestRecoveryCheckoutEndpoint:
         assert data["order_id"] == "order_rec_mock_150"
         assert data["key_id"] == "rzp_test_key_mock"
         assert data["amount"] == 150000
-        assert data["recovery_case_id"] == str(rc.id)
+        assert data["recovery_case_id"] == rc_id
         assert data["is_reused"] is False
 
         # Verify order creation payload contained metadata notes
         call_kwargs = mock_client.order.create.call_args[1]["data"]
-        assert call_kwargs["notes"]["recovery_case_id"] == str(rc.id)
+        assert call_kwargs["notes"]["recovery_case_id"] == rc_id
         assert call_kwargs["amount"] == 150000
 
         # Verify order was saved in decision_audit_trail
-        updated_rc = db_session.get(RecoveryCase, rc.id)
+        updated_rc = db_session.get(RecoveryCase, uuid.UUID(rc_id))
         assert updated_rc is not None
         assert updated_rc.decision_audit_trail["recovery_order"]["order_id"] == "order_rec_mock_150"
 
@@ -727,3 +735,172 @@ class TestRecoveryCheckoutEndpoint:
 
         assert resp.status_code == 400
         assert "already" in resp.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+class TestRecoveryCheckoutConcurrency:
+    """Concurrency-focused tests for POST /api/recovery-cases/{id}/recovery-checkout.
+
+    The endpoint is a synchronous FastAPI route, so two concurrent HTTP requests
+    run in the threadpool on separate OS threads. These tests give each request
+    its own database session (instead of the shared fixture session) so the
+    `SELECT ... FOR UPDATE` row lock is exercised across real concurrent
+    transactions, and coordinate the two requests to force the classic
+    "both observe no existing order" race.
+    """
+
+    @staticmethod
+    def _per_request_db_override():
+        """Return an override for get_db that yields a fresh session per request."""
+        test_engine = create_engine(TEST_DATABASE_URL)
+        test_session_local = sessionmaker(bind=test_engine)
+
+        def override_get_db():
+            session = test_session_local()
+            try:
+                yield session
+            finally:
+                session.close()
+
+        return override_get_db
+
+    async def test_concurrent_checkout_creates_single_active_order(self, db_session):
+        """Two concurrent checkout requests persist exactly one active recovery order.
+
+        Both requests may reach the Razorpay order-creation network call (the
+        double-checked design permits a short orphan window), but the row lock
+        guarantees only ONE recovery_order is ever persisted in the audit trail
+        and both clients receive the SAME order_id.
+        """
+        pe, rc = _create_test_case(db_session, amount_paise=150000)
+
+        app.dependency_overrides[get_db] = self._per_request_db_override()
+
+        # Coordination: force request #1 to pause inside order creation until
+        # request #2 has also observed "no existing order" and begun creating.
+        creation_lock = threading.Lock()
+        call_count = 0
+        first_started = threading.Event()
+        second_started = threading.Event()
+
+        def fake_create(*, amount_paise, currency, receipt, notes):
+            nonlocal call_count
+            with creation_lock:
+                call_count += 1
+                idx = call_count
+            if idx == 1:
+                first_started.set()
+                # Block thread #1 until thread #2 reaches order creation too.
+                second_started.wait(timeout=10)
+            else:
+                second_started.set()
+            return OrderCreationResult(
+                key_id="rzp_test_key_mock",
+                order_id=f"order_rec_conc_{idx}",
+                amount_paise=amount_paise,
+                currency=currency,
+                receipt=receipt,
+                notes=notes,
+            )
+
+        with (
+            patch.object(settings, "RAZORPAY_KEY_ID", "rzp_test_key_mock"),
+            patch.object(settings, "RAZORPAY_KEY_SECRET", "secret_mock"),
+            patch(
+                "app.api.routes.recovery_cases.create_razorpay_order_internal",
+                side_effect=fake_create,
+            ),
+        ):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+                async def do_checkout():
+                    return await client.post(
+                        f"/api/recovery-cases/{rc.id}/recovery-checkout",
+                    )
+
+                resp1, resp2 = await asyncio.gather(do_checkout(), do_checkout())
+
+        # Give the threadpool a moment to flush any pending closes.
+        await asyncio.sleep(0)
+
+        assert resp1.status_code == 200, resp1.text
+        assert resp2.status_code == 200, resp2.text
+
+        data1 = resp1.json()
+        data2 = resp2.json()
+
+        # Both clients must converge on the SAME order id.
+        assert data1["order_id"] == data2["order_id"]
+        # Exactly one request created the order; the other reused it.
+        assert {data1["is_reused"], data2["is_reused"]} == {True, False}
+        assert data1["recovery_case_id"] == str(rc.id)
+        assert data2["recovery_case_id"] == str(rc.id)
+
+        # Exactly one recovery_order persisted in the audit trail.
+        db_session.expire_all()
+        updated = db_session.get(RecoveryCase, rc.id)
+        assert updated is not None
+        trail = dict(updated.decision_audit_trail or {})
+        recovery_order = trail.get("recovery_order")
+        assert isinstance(recovery_order, dict)
+        assert recovery_order["order_id"] == data1["order_id"]
+        assert recovery_order["status"] == "created"
+
+        # Both requests DID exercise the network-call path (the forced race),
+        # but only one order survived in our system.
+        assert call_count == 2
+
+    async def test_concurrent_checkout_reuses_after_first_persists(self, db_session):
+        """A checkout request racing a completed one reuses the existing order.
+
+        This is the sequential guarantee behind the concurrency fix: once the
+        first request commits its recovery_order, a second request must reuse
+        it rather than create a duplicate — verified even when both requests
+        are issued back-to-back.
+        """
+        pe, rc = _create_test_case(db_session, amount_paise=150000)
+
+        app.dependency_overrides[get_db] = self._per_request_db_override()
+
+        order_payload = {
+            "id": "order_rec_sequential_1",
+            "amount": 150000,
+            "currency": "INR",
+            "receipt": f"rcpt_rec_{str(rc.id)[:12]}",
+            "status": "created",
+        }
+
+        with (
+            patch.object(settings, "RAZORPAY_KEY_ID", "rzp_test_key_mock"),
+            patch.object(settings, "RAZORPAY_KEY_SECRET", "secret_mock"),
+            patch("razorpay.Client") as mock_client_cls,
+        ):
+            mock_client = MagicMock()
+            mock_client.order.create.return_value = order_payload
+            mock_client_cls.return_value = mock_client
+
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                resp1 = await client.post(
+                    f"/api/recovery-cases/{rc.id}/recovery-checkout",
+                )
+                resp2 = await client.post(
+                    f"/api/recovery-cases/{rc.id}/recovery-checkout",
+                )
+
+        assert resp1.status_code == 200, resp1.text
+        assert resp2.status_code == 200, resp2.text
+        assert resp1.json()["order_id"] == "order_rec_sequential_1"
+        assert resp2.json()["order_id"] == "order_rec_sequential_1"
+        assert resp1.json()["is_reused"] is False
+        assert resp2.json()["is_reused"] is True
+
+        # The SDK was called exactly once across the two requests.
+        assert mock_client.order.create.call_count == 1
+
+        db_session.expire_all()
+        updated = db_session.get(RecoveryCase, rc.id)
+        assert updated is not None
+        recovery_order = dict(updated.decision_audit_trail or {})["recovery_order"]
+        assert recovery_order["order_id"] == "order_rec_sequential_1"
