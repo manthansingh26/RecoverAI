@@ -187,3 +187,27 @@
 **Rationale:** A single payment failure should produce a single recovery case. Multiple recovery attempts on the same event would create conflicts. Atomicity ensures no orphaned PaymentEvent without a RecoveryCase.
 
 **Consequences:** The ingestion service uses `db.flush()` within a transaction to ensure both records are persisted together. If either operation fails, the entire transaction is rolled back. Duplicate events are detected and handled without creating additional records.
+
+## ADR-020: Structured logging and per-request correlation IDs
+
+**Decision:** All backend logs are emitted as structured JSON lines (timestamp, level, logger, message, correlation_id) via a JSON formatter, and every HTTP request (including webhooks) receives an `X-Request-ID` that is propagated from a sane incoming header or generated with a CSPRNG. The correlation ID is exposed on the response and threaded through logging via a `contextvars` context var.
+
+**Rationale:** Plain-text logs without timestamps made it impossible to reconstruct a request's timeline or correlate log lines across services/stages. A per-request ID lets an operator trace a payment event from webhook ingress through execution without parsing prose.
+
+**Consequences:** A pure-ASGI middleware assigns the ID; it NEVER reads the request body, so the webhook's raw-body HMAC pipeline is unaffected. `LOG_LEVEL` is now honored by `configure_logging()`. No database column is added — correlation is a log-context concern only.
+
+## ADR-021: Webhook replay/freshness protection
+
+**Decision:** Reject webhook events whose top-level `created_at` is older than `WEBHOOK_MAX_EVENT_AGE_SECONDS` (default 300 s / 5 min), but only for *novel* event-ids that would create new state. Known event-ids (delivery retries) bypass the freshness gate and are acknowledged idempotently. Stale events return HTTP 200 with `stale=true` — never 4xx — so Razorpay stops retrying.
+
+**Rationale:** Razorpay's documented replay rule ("reject events where created_at is more than 5 minutes in the past") protects against replayed signed payloads, while at-least-once delivery requires that legitimate retries of already-processed events never be dropped. Late recovery stays valid because a `payment.captured` event is born at capture time, so its `created_at` is fresh even when a customer pays hours later.
+
+**Consequences:** HMAC remains the first trust boundary (raw body → HMAC → event-id → JSON parse → freshness → processing). Missing/malformed `created_at` is tolerated (compatibility policy). No schema change.
+
+## ADR-022: Server-side session authentication and RBAC
+
+**Decision:** Operator authentication uses server-side, DB-backed sessions keyed by an opaque 256-bit CSPRNG token stored only in an HttpOnly, Secure, SameSite=Lax, `__Host-recoverai_session` cookie (8 h absolute TTL, 30 min idle TTL, throttled `last_seen_at` updates). Passwords are hashed with Argon2id. Authorization uses a VIEWER < OPERATOR < ADMIN role hierarchy with granular permissions enforced by route-level dependencies.
+
+**Rationale:** Server-side sessions allow immediate revocation (logout, password change, disable), are resilient to XSS (HttpOnly), and provide a clean audit seam for actor attribution. RBAC keeps read-only viewers separate from operators who can approve/execute.
+
+**Consequences:** Protected routes carry `require_permission(...)` dependencies; webhook and health endpoints remain machine-authenticated (HMAC) / public. Session rows are deleted on logout and rotated on password change. No JWT, no refresh tokens, no OAuth.

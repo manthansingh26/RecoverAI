@@ -40,14 +40,93 @@ Usage (called from FastAPI lifespan in main.py):
 """
 
 import asyncio
+import copy
 import logging
+import threading
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.core.metrics import metrics
 from app.db.session import SessionLocal
 from app.services.recovery_executor import ExecutionSummary, execute_due_cases
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Scheduler status / heartbeat (Milestone 15B)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SchedulerStatus:
+    """Read-only snapshot of scheduler liveness and last-cycle statistics.
+
+    Process-local only (in-memory). Not persisted across restarts by design —
+    the scheduler is an in-process component; durability is not required to
+    answer "is the scheduler alive and is it making progress".
+    """
+
+    running: bool = False
+    last_cycle_started_at: datetime | None = None
+    last_cycle_finished_at: datetime | None = None
+    last_cycle_duration_ms: int | None = None
+    last_attempted: int = 0
+    last_succeeded: int = 0
+    last_failed: int = 0
+    last_blocked: int = 0
+    last_error: str | None = None
+    total_cycles: int = 0
+
+
+class _SchedulerStatusStore:
+    """Thread-safe store updated from the scheduler worker thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._status = SchedulerStatus()
+
+    def snapshot(self) -> SchedulerStatus:
+        with self._lock:
+            return copy.deepcopy(self._status)
+
+    def mark_running(self, running: bool) -> None:
+        with self._lock:
+            self._status.running = running
+
+    def record_cycle(
+        self,
+        *,
+        started: datetime,
+        finished: datetime,
+        duration_ms: int,
+        attempted: int,
+        succeeded: int,
+        failed: int,
+        blocked: int,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._status.last_cycle_started_at = started
+            self._status.last_cycle_finished_at = finished
+            self._status.last_cycle_duration_ms = duration_ms
+            self._status.last_attempted = attempted
+            self._status.last_succeeded = succeeded
+            self._status.last_failed = failed
+            self._status.last_blocked = blocked
+            self._status.last_error = error
+            self._status.total_cycles += 1
+
+
+# Shared module-level status store (single-process deployment).
+_scheduler_status = _SchedulerStatusStore()
+
+
+def get_scheduler_status() -> SchedulerStatus:
+    """Return a thread-safe snapshot of the current scheduler status."""
+    return _scheduler_status.snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +144,9 @@ def run_one_cycle(db: Session | None = None) -> ExecutionSummary:
     If ``db`` is None a fresh SessionLocal() is created and closed inside
     this function's own finally block.
 
+    Exceptions PROPAGATE to the caller (scheduler_loop catches them) — this
+    function does not swallow failures, it records them in SchedulerStatus.
+
     Args:
         db: Optional pre-existing DB session. When None a fresh session is
             created and owned by this function.
@@ -76,23 +158,53 @@ def run_one_cycle(db: Session | None = None) -> ExecutionSummary:
     if own_session:
         db = SessionLocal()
 
+    started = datetime.now(timezone.utc)
+    metrics.increment("scheduler_cycles_total")
     try:
         logger.debug("Scheduler cycle started")
         summary = execute_due_cases(db)
 
+        finished = datetime.now(timezone.utc)
+        duration_ms = int((finished - started).total_seconds() * 1000)
+        _scheduler_status.record_cycle(
+            started=started,
+            finished=finished,
+            duration_ms=duration_ms,
+            attempted=summary.attempted,
+            succeeded=summary.succeeded,
+            failed=summary.failed,
+            blocked=summary.blocked,
+        )
+
         if summary.attempted > 0:
             logger.info(
                 "Scheduler cycle completed: attempted=%d succeeded=%d "
-                "failed=%d blocked=%d",
+                "failed=%d blocked=%d duration_ms=%d",
                 summary.attempted,
                 summary.succeeded,
                 summary.failed,
                 summary.blocked,
+                duration_ms,
             )
         else:
             logger.debug("Scheduler cycle completed: no due cases found")
 
         return summary
+    except Exception as e:
+        metrics.increment("scheduler_failed_cycles_total")
+        finished = datetime.now(timezone.utc)
+        duration_ms = int((finished - started).total_seconds() * 1000)
+        _scheduler_status.record_cycle(
+            started=started,
+            finished=finished,
+            duration_ms=duration_ms,
+            attempted=0,
+            succeeded=0,
+            failed=0,
+            blocked=0,
+            error=str(e),
+        )
+        raise
     finally:
         if own_session:
             db.close()
@@ -210,6 +322,7 @@ class RecoveryScheduler:
             scheduler_loop(self._shutdown_event, self._interval),
             name="recovery_scheduler",
         )
+        _scheduler_status.mark_running(True)
         logger.info(
             "Recovery scheduler started (interval=%ds)", self._interval
         )
@@ -248,6 +361,7 @@ class RecoveryScheduler:
 
         self._task = None
         self._shutdown_event = None
+        _scheduler_status.mark_running(False)
         logger.info("Recovery scheduler stopped")
 
     @property

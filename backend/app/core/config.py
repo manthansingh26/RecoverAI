@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     # Must be >= 0 (0 rejects any event whose created_at is in the past).
     WEBHOOK_MAX_EVENT_AGE_SECONDS: int = 300
 
+    # Milestone 15B: Operational reliability — stuck-case diagnostics.
+    # /api/ops/stuck-cases flags RECEIVED cases older than
+    # STUCK_CASE_RECEIVED_SECONDS and REQUIRES_HUMAN cases older than
+    # STUCK_CASE_HUMAN_REVIEW_SECONDS (age measured from updated_at), plus
+    # PENDING_EXECUTION cases whose next_run_at is in the past. The endpoint
+    # is read-only and returns at most STUCK_CASE_MAX_RESULTS rows.
+    STUCK_CASE_RECEIVED_SECONDS: int = 3600
+    STUCK_CASE_HUMAN_REVIEW_SECONDS: int = 86400
+    STUCK_CASE_MAX_RESULTS: int = 100
+
     # Comma-separated list of allowed cross-origin origins for production.
     # Development/test environments always allow the local frontend origins.
     # Leave empty in production to disable all cross-origin access.
@@ -130,6 +140,9 @@ class Settings(BaseSettings):
         "LOGIN_MAX_ATTEMPTS",
         "LOGIN_ATTEMPT_WINDOW_SECONDS",
         "LOGIN_LOCKOUT_SECONDS",
+        "STUCK_CASE_RECEIVED_SECONDS",
+        "STUCK_CASE_HUMAN_REVIEW_SECONDS",
+        "STUCK_CASE_MAX_RESULTS",
     )
     @classmethod
     def _validate_positive_int(cls, v: int) -> int:

@@ -165,6 +165,38 @@ freshness evaluation.
 **`order.paid`** is never a resolution trigger. It is always acknowledged
 without state mutation regardless of its `created_at`.
 
+## Observability & Operational Reliability (Milestone 15B)
+
+The system is observable and diagnosable without any new infrastructure:
+
+- **Correlation IDs** — a pure-ASGI middleware assigns an `X-Request-ID` to
+  every HTTP request (propagated if the incoming header is sane, otherwise
+  generated with a CSPRNG). The ID is echoed on the response and threaded
+  through logging via a `contextvars` context var. The middleware never reads
+  the request body, so the webhook raw-body HMAC pipeline is unaffected.
+- **Structured logging** — all logs are JSON lines (`ts`, `level`, `logger`,
+  `message`, optional `correlation_id`) honoring `LOG_LEVEL`. Logs are
+  time-lineable and machine-queryable.
+- **Liveness vs readiness** — `GET /health` remains a static liveness probe.
+  `GET /health/ready` additionally verifies DB connectivity (`SELECT 1`) and,
+  when the scheduler is enabled, that it is running. Readiness returns 503
+  when a required dependency is down, distinguishing "process alive" from
+  "process + dependencies ready".
+- **Scheduler status / heartbeat** — an in-process `SchedulerStatus` records
+  `running`, last-cycle start/finish, duration, attempted/succeeded/failed/
+  blocked counts, last error, and total cycles. It is exposed via
+  `get_scheduler_status()` and consumed by `/health/ready`.
+- **Lightweight metrics** — in-process counters (webhook received/verified/
+  rejected_hmac/rejected_stale/duplicate/malformed/captured_resolved/
+  captured_stale/processing_seconds; scheduler cycles/failed_cycles; execution
+  attempts/failures) are exposed as JSON at `GET /metrics`. Counters are
+  process-local, reset on restart, and contain only aggregate counts — never
+  secrets, tokens, payloads, or PII.
+- **Stuck-case diagnostics** — `GET /api/ops/stuck-cases` (OPERATOR+) is a
+  read-only query flagging stuck `RECEIVED`, stuck `REQUIRES_HUMAN`, and
+  overdue `PENDING_EXECUTION` cases using the `STUCK_CASE_*` thresholds. It
+  never mutates state.
+
 ## Key Design Constraints
 
 - Raw body is verified before JSON parsing.
@@ -176,3 +208,5 @@ without state mutation regardless of its `created_at`.
 - The deterministic policy engine has final authority.
 - All actions must be auditable.
 - Schema changes are managed exclusively through Alembic migrations.
+- Observability (correlation IDs, logs, metrics, scheduler status, stuck-case
+  diagnostics) adds zero infrastructure and zero schema changes.

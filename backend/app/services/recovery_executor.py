@@ -14,6 +14,7 @@ All execution creates an ExecutionLog record for auditability.
 """
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.metrics import metrics
 from app.models.enums import (
     ExecutionMode,
     ExecutionStatus,
@@ -382,6 +384,9 @@ def execute_single_case(
     if actor is None:
         actor = "system:scheduler"
 
+    # Wall-clock execution duration (Milestone 15B observability).
+    _exec_started = time.perf_counter()
+
     try:
         rc_uuid = uuid.UUID(recovery_case_id)
     except ValueError:
@@ -445,8 +450,10 @@ def execute_single_case(
         resp_data = {"blocked": True, "reason": f"Unknown strategy: {strategy}"}
         error_msg = f"Unknown strategy: {strategy}"
 
-    # Audit attribution — record who triggered this execution (Milestone 14A).
-    req_data = {**req_data, "actor": actor}
+    # Audit attribution — record who triggered this execution (Milestone 14A),
+    # plus wall-clock duration (Milestone 15B observability — additive JSONB).
+    duration_ms = int((time.perf_counter() - _exec_started) * 1000)
+    req_data = {**req_data, "actor": actor, "execution_duration_ms": duration_ms}
 
     # Create ExecutionLog
     log = _create_execution_log(
@@ -526,6 +533,11 @@ def execute_single_case(
         "Execution for %s: strategy=%s mode=%s status=%s",
         recovery_case_id, strategy, mode.value, exec_status,
     )
+
+    # Milestone 15B operational counters (process-local, counts only).
+    metrics.increment("execution_attempts_total")
+    if exec_status == ExecutionStatus.FAILED.value:
+        metrics.increment("execution_failures_total")
 
     return ExecutionResult(
         recovery_case_id=recovery_case_id,

@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.metrics import metrics
 from app.db.session import get_db
 from app.models.enums import RecoveryStatus
 from app.models.payment_event import PaymentEvent
@@ -212,6 +213,21 @@ async def razorpay_webhook(
     """
     # 1. Read raw body bytes BEFORE any parsing, with a size cap so an
     #    arbitrarily large payload is never fully buffered into memory.
+    metrics.increment("webhook_received")
+    _request_started = time.perf_counter()
+    try:
+        return await _process_webhook(request, x_razorpay_signature, x_razorpay_event_id, db)
+    finally:
+        metrics.add("webhook_processing_seconds_total", time.perf_counter() - _request_started)
+
+
+async def _process_webhook(
+    request: Request,
+    x_razorpay_signature: str,
+    x_razorpay_event_id: str,
+    db: Session,
+) -> WebhookResponse:
+    """Inner webhook handler (split out so latency can be timed)."""
     raw_body = await _read_webhook_body(
         request, settings.RAZORPAY_WEBHOOK_MAX_BODY_BYTES
     )
@@ -224,6 +240,7 @@ async def razorpay_webhook(
     )
 
     if not verification.valid:
+        metrics.increment("webhook_rejected_hmac")
         logger.warning(
             "Webhook signature verification failed: %s", verification.reason
         )
@@ -231,6 +248,7 @@ async def razorpay_webhook(
             status_code=401,
             detail="Invalid webhook signature",
         )
+    metrics.increment("webhook_verified")
 
     # 3. Validate event ID
     if not x_razorpay_event_id:
@@ -243,6 +261,7 @@ async def razorpay_webhook(
     try:
         body_json: dict[str, Any] = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        metrics.increment("webhook_malformed")
         logger.warning("Failed to parse webhook body as JSON: %s", e)
         raise HTTPException(
             status_code=400,
@@ -270,6 +289,7 @@ async def razorpay_webhook(
     #     freshness is irrelevant.
     if event_type == "payment.failed" and _event_is_stale(body_json):
         if not _payment_event_exists(db, x_razorpay_event_id):
+            metrics.increment("webhook_rejected_stale")
             logger.warning(
                 "Ignoring stale payment.failed event %s (created_at=%s)",
                 x_razorpay_event_id,
@@ -352,6 +372,9 @@ async def razorpay_webhook(
         source="razorpay_webhook",
         signature_verified=True,
     )
+
+    if result.duplicate:
+        metrics.increment("webhook_duplicate")
 
     if not result.success:
         logger.error("Ingestion failed: %s", result.message)

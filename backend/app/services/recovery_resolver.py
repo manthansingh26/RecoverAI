@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.metrics import metrics
 from app.models.enums import ExecutionMode, ExecutionStatus, RecoveryStatus
 from app.models.execution_log import ExecutionLog
 from app.models.payment_event import PaymentEvent
@@ -156,6 +157,7 @@ def resolve_recovery_by_payment(
     # of an already-resolved case that happens to be >5 min old is acknowledged
     # here as stale (200, no mutation) — equivalent to the duplicate path below.
     if stale:
+        metrics.increment("webhook_captured_stale")
         logger.info(
             "Ignoring stale payment.captured event %s (case %s, status=%s)",
             event_id,
@@ -258,6 +260,7 @@ def resolve_recovery_by_payment(
 
     # Idempotency check: If already RESOLVED_SUCCESS, return idempotent 200 OK
     if locked_case.status == RecoveryStatus.RESOLVED_SUCCESS.value:
+        metrics.increment("webhook_duplicate")
         logger.info(
             "Case %s already RESOLVED_SUCCESS — acknowledging duplicate payment.captured event %s",
             locked_case.id,
@@ -344,6 +347,7 @@ def resolve_recovery_by_payment(
         payment_id,
         normalized.amount_paise,
     )
+    metrics.increment("webhook_captured_resolved")
 
     return WebhookResponse(
         accepted=True,
