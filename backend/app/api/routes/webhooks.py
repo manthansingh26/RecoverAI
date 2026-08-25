@@ -7,15 +7,18 @@ and resolves recovery cases on verified payment.captured events.
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.enums import RecoveryStatus
+from app.models.payment_event import PaymentEvent
 from app.models.recovery_case import RecoveryCase
 from app.schemas.webhook import WebhookResponse
 from app.services.ingestion_service import ingest_payment_event
@@ -31,6 +34,61 @@ from app.services.webhook_security import verify_razorpay_signature
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _extract_event_created_at(payload: dict[str, Any]) -> float | None:
+    """Extract the TOP-LEVEL webhook event ``created_at`` (Unix seconds).
+
+    Razorpay's standard event envelope carries ``created_at`` at the top level
+    of the event object (not ``payload.payment.entity.created_at``). This is
+    the timestamp used for replay/freshness protection.
+
+    Returns ``None`` when the field is missing or malformed — callers treat a
+    missing value as "no freshness signal" and accept the event. This is the
+    compatibility policy: real Razorpay events always include it, but trimmed
+    test payloads and older fixtures may omit it, and we must not reject them.
+    Future timestamps (clock skew) are accepted because the computed age is
+    negative, never stale.
+    """
+    raw = payload.get("created_at")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Malformed webhook created_at=%r — ignoring freshness", raw)
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _event_is_stale(payload: dict[str, Any]) -> bool:
+    """True when the top-level ``created_at`` is older than the max event age.
+
+    Implements Razorpay's documented replay rule: reject events where
+    ``created_at`` is more than ``WEBHOOK_MAX_EVENT_AGE_SECONDS`` in the past.
+    """
+    created = _extract_event_created_at(payload)
+    if created is None:
+        return False
+    return time.time() - created > settings.WEBHOOK_MAX_EVENT_AGE_SECONDS
+
+
+def _payment_event_exists(db: Session, event_id: str) -> bool:
+    """True if a PaymentEvent with this ``external_event_id`` already exists.
+
+    Uses the SAME column ingestion deduplicates on
+    (``uq_payment_events_external_event_id``) — not a new lookup mechanism.
+    Distinguishes a stale delivery retry (known event-id → acknowledge as a
+    duplicate) from a novel stale event (unknown event-id → replay, ignore).
+    """
+    return (
+        db.execute(
+            select(PaymentEvent.id).where(PaymentEvent.external_event_id == event_id)
+        ).scalar()
+        is not None
+    )
 
 
 async def _read_webhook_body(request: Request, max_bytes: int) -> bytes:
@@ -193,7 +251,39 @@ async def razorpay_webhook(
 
     event_type = body_json.get("event", "")
 
-    # 5. Canonical Recovery Resolution: payment.captured
+    # --- 5. Replay / freshness protection (Milestone 15A, Design B) ----------
+    # Razorpay's documented replay rule: reject events whose top-level
+    # created_at is more than WEBHOOK_MAX_EVENT_AGE_SECONDS in the past.
+    # A stale event MUST be acknowledged with HTTP 200 (never 4xx) so Razorpay
+    # stops retrying it. Missing/malformed created_at => no freshness signal =>
+    # accept (compatibility policy).
+    #
+    # Scoping (Design B):
+    #   - payment.failed: a KNOWN event-id is a delivery retry, not a replay —
+    #     it falls through to ingest_payment_event(), which acknowledges it as
+    #     a duplicate idempotently. A NOVEL stale event-id would otherwise
+    #     create a duplicate recovery case, so it is ignored.
+    #   - payment.captured: freshness is enforced inside the resolver AFTER its
+    #     RESOLVED_SUCCESS idempotency check, so retries of an already-resolved
+    #     case are still acknowledged while a stale capture never mutates a case.
+    #   - order.paid / other events: acknowledged without state change;
+    #     freshness is irrelevant.
+    if event_type == "payment.failed" and _event_is_stale(body_json):
+        if not _payment_event_exists(db, x_razorpay_event_id):
+            logger.warning(
+                "Ignoring stale payment.failed event %s (created_at=%s)",
+                x_razorpay_event_id,
+                body_json.get("created_at"),
+            )
+            return WebhookResponse(
+                accepted=True,
+                stale=True,
+                event_id=x_razorpay_event_id,
+                recovery_case_id=None,
+                message="Stale webhook event ignored",
+            )
+
+    # 6. Canonical Recovery Resolution: payment.captured
     if event_type == "payment.captured":
         try:
             normalized_captured = normalize_payment_captured(
@@ -208,7 +298,11 @@ async def razorpay_webhook(
                 detail=f"Invalid payment.captured payload: {e}",
             )
 
-        return resolve_recovery_by_payment(db=db, normalized=normalized_captured)
+        return resolve_recovery_by_payment(
+            db=db,
+            normalized=normalized_captured,
+            stale=_event_is_stale(body_json),
+        )
 
     # 6. Order Paid: acknowledged safely without independent financial state transition
     if event_type == "order.paid":

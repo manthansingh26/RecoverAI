@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     # Default: 1 MiB. Legitimate Razorpay webhooks are a few KB.
     RAZORPAY_WEBHOOK_MAX_BODY_BYTES: int = 1048576
 
+    # Milestone 15A: Webhook replay protection
+    # Razorpay's documented replay rule: reject events whose top-level
+    # created_at is more than this many seconds in the past. Stale events are
+    # acknowledged with HTTP 200 (stale=True) so Razorpay stops retrying them.
+    # Must be >= 0 (0 rejects any event whose created_at is in the past).
+    WEBHOOK_MAX_EVENT_AGE_SECONDS: int = 300
+
     # Comma-separated list of allowed cross-origin origins for production.
     # Development/test environments always allow the local frontend origins.
     # Leave empty in production to disable all cross-origin access.
@@ -93,6 +100,15 @@ class Settings(BaseSettings):
         if v < 1:
             raise ValueError(
                 f"RAZORPAY_WEBHOOK_MAX_BODY_BYTES must be >= 1, got {v}"
+            )
+        return v
+
+    @field_validator("WEBHOOK_MAX_EVENT_AGE_SECONDS")
+    @classmethod
+    def _validate_webhook_max_event_age(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                f"WEBHOOK_MAX_EVENT_AGE_SECONDS must be >= 0, got {v}"
             )
         return v
 

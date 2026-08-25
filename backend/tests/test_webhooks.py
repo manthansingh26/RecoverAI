@@ -15,6 +15,7 @@ Tests cover:
 import hashlib
 import hmac
 import json
+import time
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -804,7 +805,7 @@ class TestRazorpayWebhookPipeline:
             "entity": "event",
             "event": "payment.failed",
             "account_id": "acc_test",
-            "created_at": 1700000000,
+            "created_at": int(time.time()),
             "payload": {
                 "payment": {
                     "id": "pay_rzp_001",
@@ -873,7 +874,7 @@ class TestRazorpayWebhookPipeline:
             "entity": "event",
             "event": "payment.failed",
             "account_id": "acc_test",
-            "created_at": 1700000000,
+            "created_at": int(time.time()),
             "payload": {
                 "payment": {
                     "id": "pay_rzp_auto_001",
@@ -942,7 +943,7 @@ class TestRazorpayWebhookPipeline:
             "entity": "event",
             "event": "payment.failed",
             "account_id": "acc_test",
-            "created_at": 1700000000,
+            "created_at": int(time.time()),
             "payload": {
                 "payment": {
                     "id": "pay_rzp_hr_001",
@@ -1007,7 +1008,7 @@ class TestRazorpayWebhookPipeline:
             "entity": "event",
             "event": "payment.failed",
             "account_id": "acc_test",
-            "created_at": 1700000000,
+            "created_at": int(time.time()),
             "payload": {
                 "payment": {
                     "id": "pay_rzp_dup_001",
@@ -1181,7 +1182,7 @@ def _make_real_razorpay_body(
         "entity": "event",
         "event": "payment.failed",
         "account_id": "acc_test123",
-        "created_at": 1700000000,
+        "created_at": int(time.time()),
         "payload": {
             "payment": {
                 "entity": {
@@ -1367,7 +1368,7 @@ class TestRealRazorpayPayloadShape:
             "entity": "event",
             "event": "payment.failed",
             "account_id": "acc_test123",
-            "created_at": 1700000000,
+            "created_at": int(time.time()),
             "payload": {
                 "payment": {
                     "id": "pay_sim_001",
@@ -1442,5 +1443,261 @@ class TestRealRazorpayPayloadShape:
                     },
                 )
             assert response.status_code == 400
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+
+# ---------------------------------------------------------------------------
+# Milestone 15A: Webhook Replay Protection Tests
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookReplayProtection:
+    """Tests for freshness gate and stale-event handling (Design B)."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_payment_failed_accepted(self, db_session) -> None:
+        """A fresh payment.failed (created_at ≈ now) is processed normally."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_fresh_001"
+        body = make_valid_payment_failed_body()
+        body["created_at"] = int(time.time())
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["accepted"] is True
+            assert data.get("stale") is not True
+            assert data["recovery_case_id"] is not None
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_stale_novel_payment_failed_ignored(self, db_session) -> None:
+        """A stale (created_at > 5 min ago) novel payment.failed returns 200 with stale=True and creates NO records."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_stale_001"
+        body = make_valid_payment_failed_body()
+        body["created_at"] = int(time.time()) - 301  # just outside the window
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["accepted"] is True
+            assert data["stale"] is True
+            assert data["recovery_case_id"] is None
+
+            # No PaymentEvent or RecoveryCase was created
+            pe = db_session.execute(
+                select(PaymentEvent).where(PaymentEvent.external_event_id == event_id)
+            ).scalar_one_or_none()
+            assert pe is None, "Stale event must not create a PaymentEvent"
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_stale_known_event_id_retry_acknowledged(self, db_session) -> None:
+        """A stale event with a KNOWN event-id (delivery retry) is acknowledged as a duplicate."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_retry_001"
+        body = make_valid_payment_failed_body()
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                # First delivery — fresh, accepted.
+                first = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+                assert first.status_code == 200
+                assert first.json()["duplicate"] is False
+
+                # Second delivery — stale (old timestamp), but known event-id.
+                body["created_at"] = int(time.time()) - 301
+                stale_body = json.dumps(body).encode()
+                stale_sig = make_razorpay_signature(stale_body, secret)
+                second = await c.post(
+                    "/webhooks/razorpay",
+                    content=stale_body,
+                    headers={
+                        "X-Razorpay-Signature": stale_sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+                assert second.status_code == 200
+                data = second.json()
+                # The event-id is known, so it is acknowledged as a duplicate.
+                assert data["duplicate"] is True
+                # Only one PaymentEvent exists.
+                pes = db_session.execute(
+                    select(PaymentEvent).where(PaymentEvent.external_event_id == event_id)
+                ).scalars().all()
+                assert len(pes) == 1
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_invalid_hmac_stale_returns_401(self, db_session) -> None:
+        """Invalid HMAC wins over stale — 401 is returned."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_hmac_001"
+        body = make_valid_payment_failed_body()
+        body["created_at"] = int(time.time()) - 301
+        body_bytes = json.dumps(body).encode()
+        # Use a DIFFERENT secret to produce an invalid signature.
+        wrong_sig = make_razorpay_signature(body_bytes, "wrong_secret")
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": wrong_sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 401
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_missing_created_at_accepted(self, db_session) -> None:
+        """Missing top-level created_at is accepted (compatibility policy)."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_no_ts_001"
+        body = make_valid_payment_failed_body()
+        del body["created_at"]
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200
+            assert resp.json()["accepted"] is True
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_malformed_created_at_accepted(self, db_session) -> None:
+        """Malformed created_at (non-numeric) is accepted (compatibility policy)."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_bad_ts_001"
+        body = make_valid_payment_failed_body()
+        body["created_at"] = "not-a-timestamp"
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200
+            assert resp.json()["accepted"] is True
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_order_paid_ignores_freshness(self, db_session) -> None:
+        """order.paid is acknowledged without state change regardless of created_at."""
+        secret = "test_replay_secret"
+        event_id = "evt_replay_op_001"
+        body = {
+            "entity": "event",
+            "event": "order.paid",
+            "account_id": "acc_test",
+            "created_at": int(time.time()) - 3600,  # very stale
+            "payload": {"payment": {"entity": {"id": "pay_op_001", "amount": 50000}}},
+        }
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["accepted"] is True
+            assert data.get("stale") is not True
+            assert data["recovery_case_id"] is None
+            assert "order.paid" in data["message"]
         finally:
             settings.RAZORPAY_WEBHOOK_SECRET = original_secret

@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import os
+import time
 import uuid
 
 from datetime import datetime, timezone
@@ -153,12 +154,18 @@ def make_razorpay_signature(body: bytes, secret: str) -> str:
 
 
 def make_valid_payment_failed_body() -> dict:
-    """Helper to create a valid Razorpay payment.failed payload."""
+    """Helper to create a valid Razorpay payment.failed payload.
+
+    ``created_at`` is set to ``int(time.time())`` (the current timestamp)
+    so the freshness gate in the replay-protection path does not reject it.
+    Tests that need a specific or stale ``created_at`` override this field
+    on the returned dict.
+    """
     return {
         "entity": "event",
         "event": "payment.failed",
         "account_id": "acc_test123",
-        "created_at": 1700000000,
+        "created_at": int(time.time()),
         "payload": {
             "payment": {
                 "id": "pay_test123",

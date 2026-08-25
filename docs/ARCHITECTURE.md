@@ -93,24 +93,77 @@ Customer ──< PaymentEvent ──── RecoveryCase ──< ExecutionLog
 ```
 Razorpay POST /webhooks/razorpay
         ↓
-Read raw body bytes (no parsing)
+Read raw body bytes (size cap enforced)
         ↓
 Verify HMAC-SHA256 signature (timing-safe)
         ↓
+Validate x-razorpay-event-id header
+        ↓
 Parse JSON only after verification
         ↓
-Check event type == payment.failed
+Extract event type (payment.failed / payment.captured / order.paid / other)
         ↓
-Normalize payload → PaymentEvent columns
-        ↓
-Persist PaymentEvent + RecoveryCase (atomic)
-        ↓
-Return { accepted: true, duplicate: false }
+Evaluate top-level created_at freshness (Milestone 15A)
+   ┌────┴────┐
+   │ stale   │ fresh
+   v         v
+200 stale   event-type branch
+(true)      │
+            ├── payment.failed
+            │   ├── known event-id → duplicate ACK (idempotent)
+            │   └── novel → ingest → decision engine → auto-execute (SIMULATION)
+            ├── payment.captured
+            │   ├── correlated (notes / order_id / recovery_order)
+            │   │   ├── stale → 200 stale(true), no mutation
+            │   │   └── fresh → amount/currency gates → RESOLVED_SUCCESS
+            │   └── uncorrelated → 200 accepted (unrelated order)
+            ├── order.paid → 200 accepted (acknowledgement only)
+            └── other → 200 accepted (no state change)
 ```
 
-Idempotency is enforced at two levels:
+Idempotency is enforced at three levels:
 1. Application-level: check existing external_event_id before insert.
 2. Database-level: unique constraint on `payment_events.external_event_id`.
+3. ExecutionLog: unique idempotency_key prevents duplicate PAYMENT_RECOVERED logs.
+
+## Webhook Replay Protection (Milestone 15A)
+
+Razorpay delivers webhooks **at least once** — duplicate and out-of-order
+delivery is expected. The system protects against replay attacks using a
+three-layer model:
+
+1. **Idempotency** — `x-razorpay-event-id` is the primary idempotency key.
+   A known event-id is always acknowledged as a duplicate regardless of
+   age, so legitimate delivery retries are preserved.
+
+2. **Replay / freshness** — The top-level webhook event `created_at` is
+   compared against the current time. Events whose `created_at` is more
+   than `WEBHOOK_MAX_EVENT_AGE_SECONDS` (default 300 s / 5 min) in the past
+   are **ignored with HTTP 200 stale=true** so Razorpay stops retrying them.
+   HMAC verification always runs first — an invalid signature is rejected
+   at 401 regardless of the timestamp.
+
+   Scoping (Design B): freshness is enforced only for *novel* event-ids
+   that would create new state. A known event-id falls through to the
+   normal idempotency path.
+
+3. **Business correlation** — `payment.captured` resolves to a case via
+   `notes.recovery_case_id`, original `external_order_id`, or the recovery
+   order in the audit trail. Exact amount and currency validation gates
+   prevent data-corruption attacks.
+
+**Late recovery is preserved.** A `payment.captured` event is born at the
+time the payment is captured, not the time of the original failure. When a
+customer pays a recovery order hours later, the captured event has a fresh
+`created_at` and passes the freshness gate normally. The five-minute rule
+measures the age of the *event*, not the age of the business flow.
+
+**Missing or malformed `created_at`** is tolerated (compatibility policy for
+older fixtures and trimmed test payloads): the event is accepted without
+freshness evaluation.
+
+**`order.paid`** is never a resolution trigger. It is always acknowledged
+without state mutation regardless of its `created_at`.
 
 ## Key Design Constraints
 

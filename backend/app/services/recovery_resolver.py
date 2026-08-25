@@ -71,12 +71,17 @@ def _find_case_by_recovery_order_id(db: Session, order_id: str) -> RecoveryCase 
 def resolve_recovery_by_payment(
     db: Session,
     normalized: NormalizedPaymentEvent,
+    *,
+    stale: bool = False,
 ) -> WebhookResponse:
     """Validate payment.captured event and resolve the correlated RecoveryCase to RESOLVED_SUCCESS.
 
     Args:
         db: Active SQLAlchemy database session.
         normalized: Normalized payment.captured data.
+        stale: True when the webhook event's top-level created_at is older than
+            the configured max age (Milestone 15A replay protection). A stale
+            event is acknowledged with HTTP 200 and NEVER mutates a case.
 
     Returns:
         WebhookResponse with acceptance, duplicate status, and recovery_case_id.
@@ -137,6 +142,32 @@ def resolve_recovery_by_payment(
             event_id=event_id,
             recovery_case_id=None,
             message="Payment captured acknowledged (unrelated order)",
+        )
+
+    # -----------------------------------------------------------------------
+    # Step 1.5: Stale replay protection (Milestone 15A, Design B)
+    # -----------------------------------------------------------------------
+    # A stale payment.captured event must never mutate a case. This check is
+    # placed BEFORE the consistency/amount/currency gates (which raise 4xx) so
+    # a correctly signed stale event ALWAYS returns HTTP 200, letting Razorpay
+    # stop retrying it. Genuine late recovery is unaffected: a payment.captured
+    # event is born at capture time, so its created_at is fresh even when a
+    # customer pays a recovery order hours after the original failure. A retry
+    # of an already-resolved case that happens to be >5 min old is acknowledged
+    # here as stale (200, no mutation) — equivalent to the duplicate path below.
+    if stale:
+        logger.info(
+            "Ignoring stale payment.captured event %s (case %s, status=%s)",
+            event_id,
+            matched_case.id,
+            matched_case.status,
+        )
+        return WebhookResponse(
+            accepted=True,
+            stale=True,
+            event_id=event_id,
+            recovery_case_id=str(matched_case.id),
+            message="Stale webhook event ignored",
         )
 
     # -----------------------------------------------------------------------

@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -116,9 +117,15 @@ def _make_captured_payload(
     currency: str = "INR",
     status_val: str = "captured",
     notes: dict | None = None,
+    created_at: int | None = None,
 ) -> dict:
-    """Construct a real Razorpay payment.captured webhook payload dictionary."""
-    return {
+    """Construct a real Razorpay payment.captured webhook payload dictionary.
+
+    ``created_at`` (top-level event timestamp) is omitted by default, matching
+    the existing fixtures. Milestone 15A freshness tests pass an explicit value
+    (current time for fresh events, an old value for stale ones).
+    """
+    payload: dict = {
         "event": "payment.captured",
         "payload": {
             "payment": {
@@ -135,6 +142,9 @@ def _make_captured_payload(
             }
         },
     }
+    if created_at is not None:
+        payload["created_at"] = created_at
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -904,3 +914,206 @@ class TestRecoveryCheckoutConcurrency:
         assert updated is not None
         recovery_order = dict(updated.decision_audit_trail or {})["recovery_order"]
         assert recovery_order["order_id"] == "order_rec_sequential_1"
+
+
+# ---------------------------------------------------------------------------
+# Milestone 15A: payment.captured Freshness / Replay Protection Tests
+# ---------------------------------------------------------------------------
+
+
+class TestCapturedFreshnessAndLateRecovery:
+    """Webhook-route-level tests for captured-event freshness (Design B).
+
+    Key invariants:
+    - A fresh payment.captured resolves normally (including late recovery).
+    - A stale payment.captured returns 200 with stale=True and never mutates.
+    - order.paid stays acknowledgement-only regardless of freshness.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_captured_resolves_normally(self, db_session) -> None:
+        """A fresh payment.captured resolves a PENDING_EXECUTION case."""
+        secret = "test_cap_fresh_secret"
+        event_id = "evt_cap_fresh_001"
+        pe, rc = _create_test_case(db_session, amount_paise=250000)
+        assert rc.status == RecoveryStatus.PENDING_EXECUTION.value
+
+        body = _make_captured_payload(
+            payment_id="pay_cap_fresh",
+            order_id=pe.external_order_id,
+            amount_paise=250000,
+            created_at=int(time.time()),  # fresh
+        )
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["accepted"] is True
+            assert data.get("stale") is not True
+            assert data["recovery_case_id"] == str(rc.id)
+
+            db_session.expire_all()
+            updated = db_session.get(RecoveryCase, rc.id)
+            assert updated.status == RecoveryStatus.RESOLVED_SUCCESS.value
+            assert updated.next_run_at is None  # scheduler disarmed
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_stale_captured_does_not_mutate_case(self, db_session) -> None:
+        """A stale payment.captured returns 200 stale=True and never mutates the case."""
+        secret = "test_cap_stale_secret"
+        event_id = "evt_cap_stale_001"
+        pe, rc = _create_test_case(db_session, amount_paise=250000)
+        assert rc.status == RecoveryStatus.PENDING_EXECUTION.value
+
+        body = _make_captured_payload(
+            payment_id="pay_cap_stale",
+            order_id=pe.external_order_id,
+            amount_paise=250000,
+            created_at=int(time.time()) - 301,  # stale (>5 min)
+        )
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["accepted"] is True
+            assert data["stale"] is True
+
+            # Case unchanged, no PAYMENT_RECOVERED log.
+            db_session.expire_all()
+            updated = db_session.get(RecoveryCase, rc.id)
+            assert updated.status == RecoveryStatus.PENDING_EXECUTION.value
+            logs = db_session.execute(
+                select(ExecutionLog).where(ExecutionLog.recovery_case_id == rc.id)
+            ).scalars().all()
+            assert all(log.action != "PAYMENT_RECOVERED" for log in logs)
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_late_recovery_fresh_captured_still_resolves(self, db_session) -> None:
+        """Late recovery: a FRESH payment.captured (captured hours later) still resolves a RESOLVED_FAILED case.
+
+        The age calculation is based on the NEW captured event's created_at
+        (capture time), NOT the age of the original failure. This proves the
+        five-minute freshness gate does not break late recovery.
+        """
+        secret = "test_cap_late_secret"
+        event_id = "evt_cap_late_001"
+        # Case is RESOLVED_FAILED (customer paid the recovery order much later).
+        pe, rc = _create_test_case(
+            db_session,
+            status_val=RecoveryStatus.RESOLVED_FAILED.value,
+            amount_paise=250000,
+        )
+        assert rc.status == RecoveryStatus.RESOLVED_FAILED.value
+
+        body = _make_captured_payload(
+            payment_id="pay_cap_late",
+            order_id=pe.external_order_id,
+            amount_paise=250000,
+            created_at=int(time.time()),  # fresh — customer just paid
+        )
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data.get("stale") is not True
+
+            db_session.expire_all()
+            updated = db_session.get(RecoveryCase, rc.id)
+            assert updated.status == RecoveryStatus.RESOLVED_SUCCESS.value
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret
+
+    @pytest.mark.asyncio
+    async def test_stale_captured_on_already_resolved_case_acknowledged(self, db_session) -> None:
+        """A stale captured event whose case is ALREADY RESOLVED_SUCCESS is acknowledged (no mutation)."""
+        secret = "test_cap_resolved_stale_secret"
+        event_id = "evt_cap_resolved_stale_001"
+        pe, rc = _create_test_case(
+            db_session,
+            status_val=RecoveryStatus.RESOLVED_SUCCESS.value,
+            amount_paise=250000,
+        )
+        assert rc.status == RecoveryStatus.RESOLVED_SUCCESS.value
+
+        body = _make_captured_payload(
+            payment_id="pay_cap_rs",
+            order_id=pe.external_order_id,
+            amount_paise=250000,
+            created_at=int(time.time()) - 600,  # stale
+        )
+        body_bytes = json.dumps(body).encode()
+        sig = make_razorpay_signature(body_bytes, secret)
+
+        original_secret = settings.RAZORPAY_WEBHOOK_SECRET
+        settings.RAZORPAY_WEBHOOK_SECRET = secret
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+                resp = await c.post(
+                    "/webhooks/razorpay",
+                    content=body_bytes,
+                    headers={
+                        "X-Razorpay-Signature": sig,
+                        "x-razorpay-event-id": event_id,
+                        "Content-Type": "application/json",
+                    },
+                )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["accepted"] is True
+
+            # Still RESOLVED_SUCCESS, no second PAYMENT_RECOVERED log.
+            db_session.expire_all()
+            updated = db_session.get(RecoveryCase, rc.id)
+            assert updated.status == RecoveryStatus.RESOLVED_SUCCESS.value
+        finally:
+            settings.RAZORPAY_WEBHOOK_SECRET = original_secret

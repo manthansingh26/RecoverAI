@@ -48,6 +48,7 @@ class WebhookResponse(BaseModel):
 
     accepted: bool
     duplicate: bool = False
+    stale: bool = False
     event_id: str | None = None
     recovery_case_id: str | None = None
     message: str | None = None
