@@ -10,13 +10,18 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from app.api.routes.auth import router as auth_router
 from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.health import router as health_router
+from app.api.routes.ops import router as ops_router
 from app.api.routes.payments import router as payments_router
 from app.api.routes.recovery_cases import router as recovery_cases_router
 from app.api.routes.simulation import router as simulation_router
 from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.workflow import router as workflow_router
 from app.core.config import settings
-from app.services.recovery_scheduler import RecoveryScheduler
+from app.core.logging import CorrelationIdMiddleware, configure_logging
+from app.services.recovery_scheduler import (
+    RecoveryScheduler,
+    get_scheduler_status,
+)
 
 
 _DEV_CORS_ORIGINS = [
@@ -110,6 +115,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
         await scheduler.start()
 
+    # Expose scheduler heartbeat/status to routes (e.g. /health/ready).
+    app.state.scheduler_status = get_scheduler_status()
+
     try:
         yield
     finally:
@@ -119,6 +127,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
+    # Structured JSON logging + LOG_LEVEL wiring (Milestone 15B).
+    configure_logging()
+
     # Refuse to start when the production configuration is unsafe.
     if settings.APP_ENV == "production":
         _assert_production_safety()
@@ -129,6 +140,10 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    # Correlation ID middleware — pure-ASGI, never reads the request body,
+    # so the webhook raw-body HMAC pipeline is completely unaffected.
+    app.add_middleware(CorrelationIdMiddleware)
 
     # TrustedHostMiddleware — only applies a Host allowlist when configured.
     # The production startup assertion requires TRUSTED_HOSTS in production.
@@ -157,6 +172,7 @@ def create_app() -> FastAPI:
     app.include_router(recovery_cases_router)
     app.include_router(dashboard_router)
     app.include_router(payments_router)
+    app.include_router(ops_router)
 
     @app.get("/")
     async def root() -> dict[str, str]:
