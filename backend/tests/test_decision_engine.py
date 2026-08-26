@@ -313,7 +313,9 @@ class TestAuditTrail:
 
         assert result is not None
         trail = result.decision_audit_trail
-        expected_keys = {"ingestion", "classification", "recommendation", "policy"}
+        # Milestone 16B adds the "ai" section additively; ingestion,
+        # classification, recommendation, and policy remain.
+        expected_keys = {"ingestion", "classification", "recommendation", "policy", "ai"}
         assert set(trail.keys()) == expected_keys
 
 

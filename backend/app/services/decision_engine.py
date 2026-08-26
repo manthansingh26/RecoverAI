@@ -1,10 +1,16 @@
 """Decision Engine — orchestrates recovery intelligence pipeline.
 
 Flow:
-1. Classify the failure (failure_classifier)
-2. Obtain strategy recommendation (strategy_advisor)
-3. Validate with deterministic policy (policy_engine)
+1. Classify the failure (failure_classifier + optional AI diagnosis)
+2. Obtain strategy recommendation (strategy_advisor + optional AI recommendation)
+3. Validate with deterministic policy (policy_engine — FINAL AUTHORITY)
 4. Persist final decision on RecoveryCase
+
+Milestone 16A/B: the LLM is an ADVISOR ONLY. It may diagnose, recommend, and
+explain, but the deterministic PolicyEngine remains the final authority over
+financial state transitions. When the LLM is unavailable, times out, produces
+invalid output, or is disabled, the existing deterministic classifiers are used
+as the fallback — the system is indistinguishable from the pre-16A path.
 
 The Decision Engine operates on an existing RecoveryCase and its associated
 PaymentEvent. It NEVER directly executes financial actions.
@@ -17,6 +23,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.agents.diagnostician import diagnose_failure
+from app.agents.explainer import explain_decision
+from app.agents.recommender import recommend_strategy_for_diagnosis
 from app.core.config import settings
 from app.models.enums import FailureCategory, RecoveryStatus, RecoveryStrategy
 from app.models.recovery_case import RecoveryCase
@@ -105,8 +114,9 @@ def _append_to_audit_trail(
     classification: dict[str, Any],
     recommendation: dict[str, Any],
     policy: dict[str, Any],
+    ai: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Append classification, recommendation, and policy to existing audit trail.
+    """Append classification, recommendation, policy, and optional AI to audit trail.
 
     Preserves the existing 'ingestion' section without overwriting.
     """
@@ -114,6 +124,8 @@ def _append_to_audit_trail(
     trail["classification"] = classification
     trail["recommendation"] = recommendation
     trail["policy"] = policy
+    if ai is not None:
+        trail["ai"] = ai
     return trail
 
 
@@ -168,30 +180,62 @@ def run_decision_engine(
         )
         return rc
 
-    # 1. Classify failure
-    classification = classify_failure(payment_event.error_reason)
-
-    # 2. Strategy recommendation
-    recommendation = recommend_strategy(
-        category=classification.category,
-        retry_count=rc.retry_count,
+    # 1. Classify failure (AI advisory + deterministic fallback)
+    # ------------------------------------------------------------------
+    # The AI is an ADVISOR ONLY. The result carries explicit provenance
+    # (used_llm / fallback_used / source) so no string inspection is needed.
+    diagnosis_result = diagnose_failure(
+        error_reason=payment_event.error_reason,
+        error_description=payment_event.error_description,
         amount_paise=payment_event.amount_paise,
+        currency=payment_event.currency,
+        retry_count=rc.retry_count,
+    )
+    diagnosis = diagnosis_result.value
+    failure_category = FailureCategory(diagnosis.category)
+    ai_used = diagnosis_result.used_llm
+    ai_confidence = diagnosis_result.confidence
+
+    # 2. Strategy recommendation (AI advisory + deterministic fallback)
+    # ------------------------------------------------------------------
+    recommendation_result = recommend_strategy_for_diagnosis(
+        diagnosis=diagnosis,
+        amount_paise=payment_event.amount_paise,
+        currency=payment_event.currency,
+        retry_count=rc.retry_count,
+    )
+    recommendation = recommendation_result.value
+    recommendation_strategy = RecoveryStrategy(recommendation.strategy)
+    rec_ai_used = recommendation_result.used_llm
+    rec_ai_confidence = recommendation_result.confidence
+
+    # 3. Confidence check
+    # ------------------------------------------------------------------
+    # If the AI was used (not fallback) and either diagnosis or
+    # recommendation confidence is below the threshold, the case must
+    # go to human review. Low-confidence AI decisions must never proceed
+    # automatically.
+    requires_human_due_to_confidence = (
+        (ai_used and ai_confidence < settings.LLM_CONFIDENCE_THRESHOLD)
+        or (rec_ai_used and rec_ai_confidence < settings.LLM_CONFIDENCE_THRESHOLD)
     )
 
-    # 3. Policy evaluation
+    # 4. Policy evaluation (deterministic — FINAL AUTHORITY)
+    # ------------------------------------------------------------------
     policy_decision = evaluate_policy(
         amount_paise=payment_event.amount_paise,
-        failure_category=classification.category,
-        proposed_strategy=recommendation.strategy,
+        failure_category=failure_category,
+        proposed_strategy=recommendation_strategy,
         recovery_probability=recommendation.confidence,
         retry_count=rc.retry_count,
     )
 
-    # 4. Compute deterministic fields
+    # 5. Compute deterministic fields
+    # ------------------------------------------------------------------
     final_strategy = policy_decision.final_strategy
     recovery_probability = recommendation.confidence
     priority_score = _compute_priority_score(
-        classification.category,
+        failure_category,
         payment_event.amount_paise,
         recovery_probability,
     )
@@ -200,31 +244,65 @@ def run_decision_engine(
         recovery_probability,
     )
 
-    # 5. Determine status and next_run_at
-    # HUMAN_REVIEW strategy always requires human approval regardless of policy flag
-    requires_human = policy_decision.requires_human_approval or (
-        final_strategy == RecoveryStrategy.HUMAN_REVIEW
+    # 6. Determine status and next_run_at
+    # ------------------------------------------------------------------
+    # HUMAN_REVIEW strategy always requires human approval.
+    # Low-confidence AI decisions also escalate to human.
+    requires_human = (
+        policy_decision.requires_human_approval
+        or (final_strategy == RecoveryStrategy.HUMAN_REVIEW)
+        or requires_human_due_to_confidence
     )
     status, next_run_at = _determine_status_and_next_run(
         final_strategy,
         requires_human,
     )
 
-    # 6. Build audit trail (preserving ingestion data)
+    # 7. Build audit trail (preserving ingestion data + explicit source labels
+    #    + additive AI metadata)
+    # ------------------------------------------------------------------
+    # Preserve the original audit-trail field names for backward compatibility
+    # AND add explicit source/fallback_used/provider/model/prompt_version.
     classification_audit = {
-        "category": classification.category.value,
-        "confidence": classification.confidence,
-        "rule_id": classification.rule_id,
-        "reason": classification.reason,
+        "category": diagnosis.category,
+        "confidence": diagnosis.confidence,
+        "reasoning": diagnosis.reasoning,
+        "source": diagnosis_result.source,  # "ai" | "deterministic"
+        "ai_used": ai_used,
+        "fallback_used": diagnosis_result.fallback_used,
+        "provider": diagnosis_result.provider,
+        "model": diagnosis_result.model,
+        "prompt_version": diagnosis_result.prompt_version,
     }
+    # If the AI was not used, restore the deterministic classifier's fields so
+    # the audit shape is unchanged from pre-16A.
+    if not ai_used:
+        det = classify_failure(payment_event.error_reason)
+        classification_audit["rule_id"] = det.rule_id
+        classification_audit["reason"] = det.reason
+
     recommendation_audit = {
-        "strategy": recommendation.strategy.value,
+        "strategy": recommendation.strategy,
         "confidence": recommendation.confidence,
-        "reasoning_summary": recommendation.reasoning_summary,
-        "risk_flags": recommendation.risk_flags,
-        "requires_human_review": recommendation.requires_human_review,
-        "provider": recommendation.provider,
+        "reasoning": recommendation.reasoning,
+        "source": recommendation_result.source,  # "ai" | "deterministic"
+        "ai_used": rec_ai_used,
+        "fallback_used": recommendation_result.fallback_used,
+        "provider": recommendation_result.provider,
+        "model": recommendation_result.model,
+        "prompt_version": recommendation_result.prompt_version,
     }
+    if not rec_ai_used:
+        det = recommend_strategy(
+            category=failure_category,
+            retry_count=rc.retry_count,
+            amount_paise=payment_event.amount_paise,
+        )
+        recommendation_audit["reasoning_summary"] = det.reasoning_summary
+        recommendation_audit["risk_flags"] = det.risk_flags
+        recommendation_audit["requires_human_review"] = det.requires_human_review
+        recommendation_audit["provider"] = "deterministic"
+        recommendation_audit["provider_deterministic"] = det.provider
     policy_audit = {
         "approved": policy_decision.approved,
         "final_strategy": policy_decision.final_strategy.value,
@@ -233,16 +311,36 @@ def run_decision_engine(
         "applied_rules": policy_decision.applied_rules,
         "policy_reason": policy_decision.policy_reason,
     }
+    ai_audit = {
+        "provider": settings.LLM_PROVIDER,
+        "model": settings.LLM_MODEL_DIAGNOSIS,
+        "diagnosis_confidence_threshold": settings.LLM_CONFIDENCE_THRESHOLD,
+        "requires_human_due_to_confidence": requires_human_due_to_confidence,
+        "diagnosis_source": diagnosis_result.source,
+        "recommendation_source": recommendation_result.source,
+    }
+
+    # Generate an operator-facing explanation for the AI advisory.
+    ai_explanation = explain_decision(
+        diagnosis=diagnosis,
+        recommendation=recommendation,
+        amount_paise=payment_event.amount_paise,
+        currency=payment_event.currency,
+    )
+    if ai_used or rec_ai_used:
+        ai_audit["explanation"] = ai_explanation
 
     updated_trail = _append_to_audit_trail(
         rc.decision_audit_trail or {},
         classification_audit,
         recommendation_audit,
         policy_audit,
+        ai_audit,
     )
 
-    # 7. Persist to RecoveryCase
-    rc.failure_category = classification.category.value
+    # 8. Persist to RecoveryCase
+    # ------------------------------------------------------------------
+    rc.failure_category = failure_category.value
     rc.recovery_probability = recovery_probability
     rc.recommended_strategy = final_strategy.value
     rc.priority_score = priority_score

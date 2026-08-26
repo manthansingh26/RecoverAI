@@ -9,3 +9,5 @@ alembic==1.14.1
 psycopg[binary]==3.2.13
 razorpay==2.0.1
 argon2-cffi==25.1.0
+anthropic
+openai

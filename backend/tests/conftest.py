@@ -104,6 +104,25 @@ def _default_auth_override() -> None:
     app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_llm_keys() -> None:
+    """Ensure tests run isolated from external LLM API keys by default."""
+    orig_llm = settings.LLM_API_KEY
+    orig_gemini = settings.GEMINI_API_KEY
+    orig_openai = settings.OPENAI_API_KEY
+    orig_anthropic = settings.ANTHROPIC_API_KEY
+    settings.LLM_API_KEY = ""
+    settings.GEMINI_API_KEY = ""
+    settings.OPENAI_API_KEY = ""
+    settings.ANTHROPIC_API_KEY = ""
+    yield
+    settings.LLM_API_KEY = orig_llm
+    settings.GEMINI_API_KEY = orig_gemini
+    settings.OPENAI_API_KEY = orig_openai
+    settings.ANTHROPIC_API_KEY = orig_anthropic
+
+
+
 @pytest.fixture()
 def db_session() -> Session:
     """Provide a transactional database session for a single test.

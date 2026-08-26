@@ -41,6 +41,39 @@ class Settings(BaseSettings):
     STUCK_CASE_HUMAN_REVIEW_SECONDS: int = 86400
     STUCK_CASE_MAX_RESULTS: int = 100
 
+    # Milestone 16A: AI advisory layer configuration.
+    # LLM provider — the application uses a provider-agnostic abstraction.
+    LLM_PROVIDER: str = "anthropic"
+    LLM_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    GEMINI_BASE_URL: str = ""
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = ""
+    ANTHROPIC_API_KEY: str = ""
+    # Model for root-cause diagnosis. Defaults:
+    # Gemini: "gemini-2.5-flash"
+    # Anthropic: "claude-sonnet-5"
+    # OpenAI: "gpt-4o-mini" / "gpt-4o"
+    LLM_MODEL_DIAGNOSIS: str = "claude-sonnet-5"
+    # Model for explanations. Claude Haiku 4.5 — exact Claude API ID
+    # "claude-haiku-4-5-20251001" per Anthropic's official model docs.
+    LLM_MODEL_EXPLAIN: str = "claude-haiku-4-5-20251001"
+    # Timeout in seconds for each LLM API call. Minimum 5 s enforced at call time.
+    LLM_TIMEOUT_SECONDS: int = 30
+    # When True, the LLM is used for diagnosis/recommendation with deterministic
+    # fallback on failure. When False, the system uses the existing deterministic
+    # logic exclusively (no LLM calls made). Competition-safe default: True
+    # means the system always produces a decision even if the LLM is unavailable.
+    LLM_FALLBACK_ENABLED: bool = True
+    # When LLM confidence is below this threshold, the downstream integration
+    # should consider escalating to REQUIRES_HUMAN. Not enforced in this
+    # advisory layer — the Decision Engine integration uses it.
+    LLM_CONFIDENCE_THRESHOLD: float = 0.6
+    # Opt-in live smoke test flag. When True (and LLM_API_KEY is set), a single
+    # test exercises the real provider. Default False — the normal test suite
+    # never makes external API calls.
+    LLM_LIVE_TEST: bool = False
+
     # Comma-separated list of allowed cross-origin origins for production.
     # Development/test environments always allow the local frontend origins.
     # Leave empty in production to disable all cross-origin access.

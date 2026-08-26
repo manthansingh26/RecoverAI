@@ -210,3 +210,77 @@ The system is observable and diagnosable without any new infrastructure:
 - Schema changes are managed exclusively through Alembic migrations.
 - Observability (correlation IDs, logs, metrics, scheduler status, stuck-case
   diagnostics) adds zero infrastructure and zero schema changes.
+- AI advisory layer (Milestone 16A): LLM is an advisor only — it may diagnose,
+  recommend, and explain, but the deterministic PolicyEngine remains the
+  final authority over financial state transitions. A provider-agnostic LLM
+  abstraction (initial: Claude) with strict Pydantic schema validation and
+  deterministic fallback ensures the system never acts on unvalidated
+  model output.
+
+## Milestone 16C — Evaluation Integrity
+
+The evaluation framework measures whether RecoverAI produces better
+revenue-recovery outcomes than a deterministic baseline. It is built for
+integrity first: the evaluator is independent of the agent.
+
+### Seed dataset
+`generate_evaluation_batch(size, seed)` produces a deterministic batch of
+synthetic `EvaluationCase` records from a fixed seed (splitmix64-style PRNG —
+reproducible, no LLM). The batch is diverse (transient / authentication /
+hard / unknown failures, high / low value, varied retry counts and customer
+histories). Each case carries a `hidden_failure_category` ground-truth field
+that is marked internal and never fed to the agent.
+
+### Frozen customer-response model
+`simulate_customer_response(case, strategy)` is the frozen ground-truth
+outcome generator. It is a pure deterministic function (score + threshold),
+never calls the LLM, and never depends on RecoverAI's predictions. The same
+(case, strategy) always yields the same outcome. Hard failures cannot recover
+through retry; transient + retry and authentication + payment-link recover at
+higher rates; unknown failures recover at lower rates.
+
+### Baseline
+`baseline_strategy_for_case(case)` implements a simple, documented
+"Retry Everything" baseline (retry everything except hard failures → STOP).
+It is LLM-free and uses the SAME frozen customer-response model — this is the
+critical fair-comparison invariant.
+
+### RecoverAI evaluation
+The evaluator runs each case through the RecoverAI advisory layer
+(diagnosis + recommendation + deterministic PolicyEngine) and records
+per-case provenance (diagnosis_source, recommendation_source, policy decision,
+escalation, safe stop, customer response, costs, net recovered). It operates
+on in-memory `EvaluationCase` objects and never mutates production
+`RecoveryCase` rows.
+
+### Metric definitions (integer paise throughout)
+- **Gross at risk** = sum of `amount_paise` across cases.
+- **Recovered amount** = sum of `recovered_amount_paise` where customer paid.
+- **Net recovered** = recovered − outreach cost − churn cost.
+- **Recovery rate** = recovered_cases / total_cases.
+- **Baseline recovery rate** = same over baseline outcomes.
+- **Uplift** = (recoverai_net − baseline_net) / baseline_net; 0 when
+  baseline_net == 0 (safe division).
+- **Escalation rate** = escalated cases / total.
+- **Safe stop rate** = STOP_RECOVERY cases / total.
+- **Policy block rate** = policy-blocked cases / total.
+- **AI usage rate** = cases with recommendation_source == "ai" / total.
+- **AI fallback rate** = cases where diagnosis and recommendation sources
+  differ / total.
+- **Cost per recovered rupee** = outreach cost / recovered amount.
+
+### No evaluation leakage
+- Ground truth is generated before RecoverAI is evaluated.
+- Customer outcomes are generated independently by the frozen model.
+- The same response model is used for baseline and RecoverAI.
+- RecoverAI's predicted recovery is never used as ground truth.
+- The response model is never changed based on observed RecoverAI results.
+- The LLM can never choose evaluation parameters.
+
+### Deterministic reproducibility
+With the LLM disabled, evaluating the same batch twice yields identical
+results. No external API calls are made in the default test suite (the LLM
+live test is gated behind `LLM_LIVE_TEST=true` + a real key).
+
+**No actual measured recovery-rate claims are asserted in documentation yet —
+the evaluator must be executed before any results are reported.**
